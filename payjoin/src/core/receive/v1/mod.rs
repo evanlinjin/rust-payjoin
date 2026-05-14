@@ -93,6 +93,19 @@ pub struct UncheckedOriginalPayload {
 }
 
 impl UncheckedOriginalPayload {
+    /// Extracts the original transaction received from the sender without
+    /// consuming the typestate.
+    ///
+    /// Use this when the broadcast-suitability decision must happen off the
+    /// thread driving the receiver state machine — for example, when delegating
+    /// the `testmempoolaccept` RPC to another task. Inspecting the transaction
+    /// is read-only and does not bypass [`Self::check_broadcast_suitability`];
+    /// the caller is still expected to call that method (or
+    /// [`Self::assume_interactive_receiver`]) to advance the typestate.
+    pub fn extract_original_tx(&self) -> bitcoin::Transaction {
+        self.original.psbt.clone().extract_tx_unchecked_fee_rate()
+    }
+
     /// Checks that the original PSBT in the proposal can be broadcasted.
     ///
     /// If the receiver is a non-interactive payment processor (ex. a donation page which generates
@@ -514,6 +527,28 @@ mod tests {
             }
             _ => panic!("Expected PsbtBelowFeeRate error, got: {proposal_below_min_fee:?}"),
         }
+    }
+
+    #[test]
+    fn extract_original_tx_does_not_consume_typestate() {
+        let proposal = unchecked_proposal_from_test_vector();
+
+        let peeked = proposal.extract_original_tx();
+
+        let captured = std::cell::RefCell::new(None);
+        let _ = proposal
+            .clone()
+            .check_broadcast_suitability(None, |tx| {
+                *captured.borrow_mut() = Some(tx.clone());
+                Ok(true)
+            })
+            .expect("broadcast suitability should succeed");
+
+        let from_closure = captured.into_inner().expect("can_broadcast closure invoked");
+        assert_eq!(peeked, from_closure, "peek and closure-observed tx must agree");
+
+        // Typestate is still usable after the peek.
+        let _ = proposal.check_broadcast_suitability(None, |_| Ok(true)).expect("still usable");
     }
 
     #[test]
