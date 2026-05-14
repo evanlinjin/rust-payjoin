@@ -721,6 +721,16 @@ impl Receiver<MaybeInputsOwned> {
         self.original.psbt.clone().extract_tx_unchecked_fee_rate()
     }
 
+    /// Returns the `script_pubkey` of every sender input, in the same order
+    /// they are presented to the [`Self::check_inputs_not_owned`] closure.
+    ///
+    /// Callers that batch the ownership decision off-thread can rely on the
+    /// returned `Vec` aligning index-for-index with what `is_owned` would
+    /// have been called with.
+    pub fn sender_input_script_pubkeys(&self) -> Result<Vec<bitcoin::ScriptBuf>, Error> {
+        self.state.original.sender_input_script_pubkeys()
+    }
+
     /// Check that the original PSBT has no receiver-owned inputs.
     ///
     /// An attacker can try to spend the receiver's own inputs. This check prevents that.

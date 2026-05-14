@@ -382,6 +382,30 @@ impl OriginalPayload {
         }
     }
 
+    /// Returns the `script_pubkey` of every sender input, in the same order
+    /// they are presented to the [`Self::check_inputs_not_owned`] closure.
+    ///
+    /// This iteration order is part of the API contract — callers that batch
+    /// the ownership check off-thread (e.g. a sans-IO driver) can rely on the
+    /// returned `Vec` aligning index-for-index with the sequence of `is_owned`
+    /// invocations [`Self::check_inputs_not_owned`] would have made.
+    ///
+    /// Errors if any input is missing the prevout information needed to
+    /// extract its `script_pubkey`. The error returned matches what
+    /// [`Self::check_inputs_not_owned`] would have raised for the same PSBT;
+    /// the session must be aborted in either case.
+    pub fn sender_input_script_pubkeys(&self) -> Result<Vec<ScriptBuf>, Error> {
+        self.psbt
+            .input_pairs()
+            .map(|input| {
+                input
+                    .previous_txout()
+                    .map(|txout| txout.script_pubkey.clone())
+                    .map_err(|e| InternalPayloadError::PrevTxOut(e).into())
+            })
+            .collect()
+    }
+
     /// Check that the original PSBT has no receiver-owned inputs.
     ///
     /// An attacker can try to spend the receiver's own inputs. This check prevents that.
