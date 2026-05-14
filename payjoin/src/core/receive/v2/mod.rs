@@ -619,6 +619,19 @@ pub struct UncheckedOriginalPayload {
 /// If you are implementing an interactive payment receiver, then such checks are not necessary, and you
 /// can go ahead with calling [`Receiver<UncheckedOriginalPayload>::assume_interactive_receiver`] to move on to the next typestate.
 impl Receiver<UncheckedOriginalPayload> {
+    /// Extracts the original transaction received from the sender without
+    /// consuming the typestate.
+    ///
+    /// Use this when the broadcast-suitability decision must happen off the
+    /// thread driving the receiver state machine — for example, when delegating
+    /// the `testmempoolaccept` RPC to another task. Inspecting the transaction
+    /// is read-only and does not bypass [`Self::check_broadcast_suitability`];
+    /// the caller is still expected to call that method (or
+    /// [`Self::assume_interactive_receiver`]) to advance the typestate.
+    pub fn extract_original_tx(&self) -> bitcoin::Transaction {
+        self.state.original.psbt.clone().extract_tx_unchecked_fee_rate()
+    }
+
     /// Checks that the original PSBT in the proposal can be broadcasted.
     ///
     /// If the receiver is a non-interactive payment processor (ex. a donation page which generates
