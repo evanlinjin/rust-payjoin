@@ -144,6 +144,16 @@ impl MaybeInputsOwned {
         self.original.psbt.clone().extract_tx_unchecked_fee_rate()
     }
 
+    /// Returns the `script_pubkey` of every sender input, in the same order
+    /// they are presented to the [`Self::check_inputs_not_owned`] closure.
+    ///
+    /// Callers that batch the ownership decision off-thread can rely on the
+    /// returned `Vec` aligning index-for-index with what `is_owned` would
+    /// have been called with.
+    pub fn sender_input_script_pubkeys(&self) -> Result<Vec<bitcoin::ScriptBuf>, Error> {
+        self.original.sender_input_script_pubkeys()
+    }
+
     /// Check that the original PSBT has no receiver-owned inputs.
     ///
     /// An attacker can try to spend the receiver's own inputs. This check prevents that.
@@ -514,6 +524,24 @@ mod tests {
             }
             _ => panic!("Expected PsbtBelowFeeRate error, got: {proposal_below_min_fee:?}"),
         }
+    }
+
+    #[test]
+    fn sender_input_script_pubkeys_matches_check_inputs_not_owned() {
+        let maybe_inputs_owned = maybe_inputs_owned_from_test_vector();
+
+        let from_accessor =
+            maybe_inputs_owned.sender_input_script_pubkeys().expect("test psbt has prevouts");
+
+        let from_closure = std::cell::RefCell::new(Vec::<bitcoin::ScriptBuf>::new());
+        maybe_inputs_owned
+            .check_inputs_not_owned(&mut |spk| {
+                from_closure.borrow_mut().push(spk.to_owned());
+                Ok(false)
+            })
+            .expect("check_inputs_not_owned should succeed on this test vector");
+
+        assert_eq!(from_accessor, from_closure.into_inner());
     }
 
     #[test]
