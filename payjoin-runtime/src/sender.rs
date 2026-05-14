@@ -2,19 +2,20 @@
 //!
 //! The sender's only wallet decision — signing the proposal PSBT once the
 //! receiver returns one — is surfaced as [`SenderStep::SignAndFinalize`].
-//! The runtime never blocks on a wallet call.
-
-use std::sync::{Arc, Mutex};
+//! The runtime never blocks on a wallet call and never goes through a
+//! [`SessionPersister`](payjoin::persist::SessionPersister) callback — every
+//! transition is consumed via
+//! [`deconstruct`](payjoin::persist::MaybeFatalTransition::deconstruct).
 
 use bitcoin::{Amount, FeeRate, Psbt, Transaction};
-use payjoin::persist::OptionalTransitionOutcome;
+use payjoin::persist::{OptionalTransitionOutcome, PersistAction};
 use payjoin::send::v2::{
     replay_event_log, PollingForProposal, SendSession, Sender, SenderBuilder, SessionEvent,
     SessionOutcome, WithReplyKey,
 };
 use payjoin::{PjUri, Request};
 
-use crate::persister::{Capturing, Replay};
+use crate::persister::Replay;
 use crate::Error;
 
 /// What the caller should do next to advance a [`SenderSession`].
@@ -54,7 +55,7 @@ pub struct SenderSession {
     ohttp_relay: String,
     state: Option<State>,
     result: Option<(Transaction, Amount)>,
-    events: Arc<Mutex<Vec<SessionEvent>>>,
+    events: Vec<SessionEvent>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -96,13 +97,12 @@ impl SenderSession {
         ohttp_relay: impl Into<String>,
         min_fee_rate: FeeRate,
     ) -> Result<Self, Error> {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let persister = Capturing::new(events.clone());
-        let session = SenderBuilder::new(psbt, uri)
+        let mut events = Vec::new();
+        let (action, session) = SenderBuilder::new(psbt, uri)
             .build_recommended(min_fee_rate)
             .map_err(Error::payjoin)?
-            .save(&persister)
-            .map_err(Error::payjoin)?;
+            .deconstruct();
+        record(&mut events, action);
         Ok(Self {
             ohttp_relay: ohttp_relay.into(),
             state: Some(State::PostingOriginal(session)),
@@ -148,7 +148,7 @@ impl SenderSession {
             ohttp_relay: ohttp_relay.into(),
             state: Some(state),
             result: None,
-            events: Arc::new(Mutex::new(Vec::new())),
+            events: Vec::new(),
         })
     }
 
@@ -164,9 +164,8 @@ impl SenderSession {
 
     /// Advance the state machine and report what the caller should do next.
     pub fn poll(&mut self) -> SenderStep {
-        let drained = self.drain_events();
-        if !drained.is_empty() {
-            return SenderStep::Save(drained);
+        if !self.events.is_empty() {
+            return SenderStep::Save(std::mem::take(&mut self.events));
         }
         let state = match self.state.take() {
             Some(s) => s,
@@ -208,18 +207,6 @@ impl SenderSession {
         };
         self.state = Some(next);
         Ok(())
-    }
-
-    fn drain_events(&self) -> Vec<SessionEvent> {
-        self.events
-            .lock()
-            .expect("captured-events mutex poisoned")
-            .drain(..)
-            .collect()
-    }
-
-    fn persister(&self) -> Capturing<SessionEvent> {
-        Capturing::new(self.events.clone())
     }
 
     fn step(&self, state: State) -> (State, SenderStep) {
@@ -264,23 +251,25 @@ impl SenderSession {
         }
     }
 
-    fn consume_response(&self, state: State, bytes: Vec<u8>) -> State {
+    fn consume_response(&mut self, state: State, bytes: Vec<u8>) -> State {
         match state {
             State::AwaitingPostAck { session, ctx } => {
-                let persister = self.persister();
-                match session.process_response(&bytes, ctx).save(&persister) {
+                let (action, outcome) = session.process_response(&bytes, ctx).deconstruct();
+                record(&mut self.events, action);
+                match outcome {
                     Ok(next) => State::PollingProposal {
                         session: next,
                         pending_backoff: false,
                     },
-                    Err(e) => State::Failed(Some(Error::payjoin(e))),
+                    Err(api) => State::Failed(Some(Error::from_api(api))),
                 }
             }
             State::AwaitingProposalPoll { session, ctx } => {
-                let persister = self.persister();
-                let outcome = match session.process_response(&bytes, ctx).save(&persister) {
+                let (action, outcome) = session.process_response(&bytes, ctx).deconstruct();
+                record(&mut self.events, action);
+                let outcome = match outcome {
                     Ok(o) => o,
-                    Err(e) => return State::Failed(Some(Error::payjoin(e))),
+                    Err(api) => return State::Failed(Some(Error::from_api(api))),
                 };
                 match outcome {
                     OptionalTransitionOutcome::Stasis(session) => State::PollingProposal {
@@ -304,5 +293,13 @@ impl SenderSession {
             .extract_tx()
             .map_err(|e| Error::Wallet(format!("extract_tx after signing: {e}")))?;
         Ok((tx, fee))
+    }
+}
+
+/// Append `action`'s event (if any) to the session's buffered event log.
+fn record(events: &mut Vec<SessionEvent>, action: PersistAction<SessionEvent>) {
+    match action {
+        PersistAction::Save(e) | PersistAction::SaveAndClose(e) => events.push(e),
+        PersistAction::NoOp => {}
     }
 }

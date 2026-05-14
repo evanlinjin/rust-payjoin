@@ -3,21 +3,23 @@
 //! Every wallet decision the receiver protocol needs (broadcast suitability,
 //! SPK ownership, contributed inputs, PSBT signing) is surfaced as a
 //! [`ReceiverStep`] variant and answered through the matching `feed_*` method.
-//! The runtime itself never blocks on a wallet call.
-
-use std::sync::{Arc, Mutex};
+//! The runtime itself never blocks on a wallet call and never goes through
+//! payjoin's [`SessionPersister`](payjoin::persist::SessionPersister)
+//! callback — every transition is consumed via
+//! [`deconstruct`](payjoin::persist::MaybeFatalTransition::deconstruct), which
+//! hands the event back as plain data.
 
 use bitcoin::{OutPoint, Psbt, ScriptBuf, Transaction};
-use payjoin::persist::OptionalTransitionOutcome;
+use payjoin::persist::{OptionalTransitionOutcome, PersistAction};
 use payjoin::receive::v2::{
     replay_event_log, Initialized, MaybeInputsOwned, PayjoinProposal, ProvisionalProposal,
     ReceiveSession, Receiver, ReceiverBuilder, SessionEvent, SessionOutcome,
     UncheckedOriginalPayload, WantsInputs,
 };
 use payjoin::receive::InputPair;
-use payjoin::{ImplementationError, Request};
+use payjoin::Request;
 
-use crate::persister::{Capturing, Replay};
+use crate::persister::Replay;
 use crate::{Error, FeeRange};
 
 /// What the caller should do next to advance a [`ReceiverSession`].
@@ -80,7 +82,7 @@ pub struct ReceiverSession {
     ohttp_relay: String,
     pj_uri: String,
     state: Option<State>,
-    events: Arc<Mutex<Vec<SessionEvent>>>,
+    events: Vec<SessionEvent>,
     /// Outpoints of the sender's inputs, captured from the original
     /// transaction as soon as it lands. Used at `NeedSignedPsbt` time to
     /// identify those inputs in the proposal and clear their stale finalized
@@ -144,9 +146,9 @@ impl ReceiverSession {
         ohttp_relay: impl Into<String>,
         fee_range: FeeRange,
     ) -> Result<Self, Error> {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let persister = Capturing::new(events.clone());
-        let session = builder.build().save(&persister).map_err(Error::payjoin)?;
+        let mut events = Vec::new();
+        let (action, session) = builder.build().deconstruct();
+        record(&mut events, action);
         let pj_uri = session.pj_uri().to_string();
         Ok(Self {
             fee_range,
@@ -164,9 +166,9 @@ impl ReceiverSession {
     /// Resume a session from a previously-persisted event log.
     ///
     /// `events` should be the complete sequence of session events as they were
-    /// recorded from [`ReceiverStep::Save`], in order. The runtime replays them
-    /// through payjoin's state machine to reconstruct the receiver's current
-    /// state, then continues from there.
+    /// recorded from [`ReceiverStep::Save`], in order. The runtime replays
+    /// them through payjoin's state machine to reconstruct the receiver's
+    /// current state, then continues from there.
     ///
     /// # Atomic-persistence requirement
     ///
@@ -217,9 +219,7 @@ impl ReceiverSession {
             ReceiveSession::Closed(outcome) => State::Failed(Some(Error::Payjoin(format!(
                 "session previously closed: {outcome:?}"
             )))),
-            // Any other variant means the event log ended mid-batch. The
-            // state machine has no clean re-entry point inside a `feed_*`
-            // sequence, so refuse.
+            // Any other variant means the event log ended mid-batch.
             other => {
                 return Err(Error::Payjoin(format!(
                     "cannot resume from intermediate state {other:?}; event log was not \
@@ -233,7 +233,7 @@ impl ReceiverSession {
             ohttp_relay: ohttp_relay.into(),
             pj_uri,
             state: Some(state),
-            events: Arc::new(Mutex::new(Vec::new())),
+            events: Vec::new(),
             sender_input_outpoints: Vec::new(),
         })
     }
@@ -245,11 +245,10 @@ impl ReceiverSession {
 
     /// Advance the state machine and report what the caller should do next.
     pub fn poll(&mut self) -> ReceiverStep {
-        // Drain any captured events first — the caller must persist them
+        // Drain any buffered events first — the caller must persist them
         // before we issue any further side-effecting requests.
-        let drained = self.drain_events();
-        if !drained.is_empty() {
-            return ReceiverStep::Save(drained);
+        if !self.events.is_empty() {
+            return ReceiverStep::Save(std::mem::take(&mut self.events));
         }
 
         let state = match self.state.take() {
@@ -276,9 +275,9 @@ impl ReceiverSession {
         let state = self.state.take().ok_or(Error::Terminated)?;
         let next = match state {
             State::NeedBroadcastCheck { session, tx } => {
-                // Capture the sender's input outpoints from the original tx
-                // — we'll need them later to clear stale finalized fields on
-                // the proposal PSBT before surfacing it for signing.
+                // Capture the sender's input outpoints from the original tx —
+                // we need them later to clear stale finalized fields on the
+                // proposal PSBT before surfacing it for signing.
                 self.sender_input_outpoints =
                     tx.input.iter().map(|i| i.previous_output).collect();
                 self.advance_broadcast(session, ok)
@@ -357,18 +356,6 @@ impl ReceiverSession {
         Ok(())
     }
 
-    fn drain_events(&self) -> Vec<SessionEvent> {
-        self.events
-            .lock()
-            .expect("captured-events mutex poisoned")
-            .drain(..)
-            .collect()
-    }
-
-    fn persister(&self) -> Capturing<SessionEvent> {
-        Capturing::new(self.events.clone())
-    }
-
     fn step(&self, state: State) -> (State, ReceiverStep) {
         match state {
             State::Polling { session, pending_backoff: true } => (
@@ -424,13 +411,14 @@ impl ReceiverSession {
         }
     }
 
-    fn consume_response(&self, state: State, bytes: Vec<u8>) -> State {
+    fn consume_response(&mut self, state: State, bytes: Vec<u8>) -> State {
         match state {
             State::AwaitingPoll { session, ctx } => {
-                let persister = self.persister();
-                let outcome = match session.process_response(&bytes, ctx).save(&persister) {
+                let (action, outcome) = session.process_response(&bytes, ctx).deconstruct();
+                record(&mut self.events, action);
+                let outcome = match outcome {
                     Ok(o) => o,
-                    Err(e) => return State::Failed(Some(Error::payjoin(e))),
+                    Err(api) => return State::Failed(Some(Error::from_api(api))),
                 };
                 match outcome {
                     OptionalTransitionOutcome::Stasis(session) => State::Polling {
@@ -451,17 +439,17 @@ impl ReceiverSession {
     }
 
     fn advance_broadcast(
-        &self,
+        &mut self,
         session: Receiver<UncheckedOriginalPayload>,
         ok: bool,
     ) -> State {
-        let persister = self.persister();
-        let maybe_inputs_owned = match session
+        let (action, outcome) = session
             .check_broadcast_suitability(self.fee_range.min, |_| Ok(ok))
-            .save(&persister)
-        {
+            .deconstruct();
+        record(&mut self.events, action);
+        let maybe_inputs_owned = match outcome {
             Ok(s) => s,
-            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+            Err(api) => return State::Failed(Some(Error::from_api(api))),
         };
         match need_ownership_state(maybe_inputs_owned) {
             Ok(state) => state,
@@ -470,56 +458,56 @@ impl ReceiverSession {
     }
 
     fn advance_ownership(
-        &self,
+        &mut self,
         session: Receiver<MaybeInputsOwned>,
         input_answers: &[bool],
         output_answers: &[bool],
     ) -> State {
-        let persister = self.persister();
         let input_idx = std::cell::Cell::new(0usize);
-        let inputs_seen = match session
+        let (action, outcome) = session
             .check_inputs_not_owned(&mut |_spk| {
                 let i = input_idx.get();
                 input_idx.set(i + 1);
                 Ok(input_answers[i])
             })
-            .save(&persister)
-        {
+            .deconstruct();
+        record(&mut self.events, action);
+        let inputs_seen = match outcome {
             Ok(s) => s,
-            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+            Err(api) => return State::Failed(Some(Error::from_api(api))),
         };
 
-        let outputs_unknown = match inputs_seen
+        let (action, outcome) = inputs_seen
             .check_no_inputs_seen_before(&mut |_| Ok(false))
-            .save(&persister)
-        {
+            .deconstruct();
+        record(&mut self.events, action);
+        let outputs_unknown = match outcome {
             Ok(s) => s,
-            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+            Err(api) => return State::Failed(Some(Error::from_api(api))),
         };
 
         let output_idx = std::cell::Cell::new(0usize);
-        let wants_outputs = match outputs_unknown
+        let (action, outcome) = outputs_unknown
             .identify_receiver_outputs(&mut |_spk| {
                 let i = output_idx.get();
                 output_idx.set(i + 1);
                 Ok(output_answers[i])
             })
-            .save(&persister)
-        {
+            .deconstruct();
+        record(&mut self.events, action);
+        let wants_outputs = match outcome {
             Ok(s) => s,
-            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+            Err(api) => return State::Failed(Some(Error::from_api(api))),
         };
 
-        let wants_inputs = match wants_outputs.commit_outputs().save(&persister) {
-            Ok(s) => s,
-            Err(e) => return State::Failed(Some(Error::payjoin(e))),
-        };
+        let (action, wants_inputs) = wants_outputs.commit_outputs().deconstruct();
+        record(&mut self.events, action);
 
         State::NeedContribute { session: wants_inputs }
     }
 
     fn advance_contribute(
-        &self,
+        &mut self,
         session: Receiver<WantsInputs>,
         inputs: Vec<InputPair>,
     ) -> State {
@@ -542,17 +530,15 @@ impl ReceiverSession {
                 return State::Failed(Some(Error::Payjoin(format!("contribute_inputs: {e:?}"))))
             }
         };
-        let persister = self.persister();
-        let wants_fee_range = match session.commit_inputs().save(&persister) {
-            Ok(s) => s,
-            Err(e) => return State::Failed(Some(Error::payjoin(e))),
-        };
-        let provisional = match wants_fee_range
+        let (action, wants_fee_range) = session.commit_inputs().deconstruct();
+        record(&mut self.events, action);
+        let (action, outcome) = wants_fee_range
             .apply_fee_range(self.fee_range.min, self.fee_range.max)
-            .save(&persister)
-        {
+            .deconstruct();
+        record(&mut self.events, action);
+        let provisional = match outcome {
             Ok(s) => s,
-            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+            Err(api) => return State::Failed(Some(Error::from_api(api))),
         };
         let mut psbt = provisional.psbt_to_sign();
         // Sender inputs in the proposal still carry their pre-payjoin
@@ -568,19 +554,27 @@ impl ReceiverSession {
     }
 
     fn advance_finalize(
-        &self,
+        &mut self,
         session: Receiver<ProvisionalProposal>,
         signed: Psbt,
     ) -> State {
-        let persister = self.persister();
-        let finalized = match session
+        let (action, outcome) = session
             .finalize_proposal(|_psbt| Ok(signed.clone()))
-            .save(&persister)
-        {
+            .deconstruct();
+        record(&mut self.events, action);
+        let finalized = match outcome {
             Ok(s) => s,
-            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+            Err(api) => return State::Failed(Some(Error::from_api(api))),
         };
         State::Posting(finalized)
+    }
+}
+
+/// Append `action`'s event (if any) to the session's buffered event log.
+fn record(events: &mut Vec<SessionEvent>, action: PersistAction<SessionEvent>) {
+    match action {
+        PersistAction::Save(e) | PersistAction::SaveAndClose(e) => events.push(e),
+        PersistAction::NoOp => {}
     }
 }
 
@@ -618,8 +612,3 @@ fn need_ownership_state(session: Receiver<MaybeInputsOwned>) -> Result<State, Er
         output_spks,
     })
 }
-
-// Suppress the unused-import warning for ImplementationError on builds where
-// no caller-facing path uses it; it's still part of `payjoin`'s public surface
-// we hand back through `Error::payjoin`.
-const _: fn(ImplementationError) = |_| {};
