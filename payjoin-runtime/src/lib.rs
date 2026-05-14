@@ -3,27 +3,46 @@
 //! `payjoin_runtime` exposes a driver per role ([`ReceiverSession`],
 //! [`SenderSession`]) that owns the multi-stage payjoin typestate, the OHTTP
 //! polling cycle, and the `.save(&persister)` ceremony. The caller drives each
-//! session by exchanging [`Request`] / response bytes with their preferred HTTP
-//! transport and supplies wallet-aware decisions through the [`ReceiverWallet`]
-//! / [`SenderWallet`] traits.
+//! session by alternating [`poll`](ReceiverSession::poll) — which yields a
+//! [`ReceiverStep`] / [`SenderStep`] describing the next side effect — and one
+//! of the `feed_*` methods, which delivers the answer back to the runtime.
 //!
-//! The runtime is wallet-agnostic: it depends only on `payjoin`, `bitcoin`, and
-//! `bitcoin-ohttp`. Bridge crates (e.g. `bdk_payjoin`) layer wallet ergonomics
-//! on top.
+//! Every external side effect (HTTP, sleep, wallet decision, signing) is
+//! surfaced as its own [`ReceiverStep`] / [`SenderStep`] variant. The runtime
+//! itself never performs IO and never calls back into a wallet trait; the
+//! caller routes those decisions wherever they wish (a worker thread, an async
+//! task, a hardware signer) and feeds the answer back when ready.
 //!
-//! # Sketch
+//! # Receiver sketch
 //!
 //! ```ignore
-//! let mut session = ReceiverSession::new(builder, relay, wallet, fee_range)?;
+//! let mut session = ReceiverSession::new(builder, relay, fee_range)?;
 //! loop {
 //!     match session.poll() {
-//!         Step::SendRequest(req) => {
+//!         ReceiverStep::Save(events) => persist_atomically(events),
+//!         ReceiverStep::SendRequest(req) => {
 //!             let resp = http.post(req).await?;
 //!             session.feed_response(resp.bytes().to_vec())?;
 //!         }
-//!         Step::Backoff => sleep(Duration::from_secs(2)).await,
-//!         Step::Done => break,
-//!         Step::Failed(e) => return Err(e.into()),
+//!         ReceiverStep::Backoff => sleep(Duration::from_secs(2)).await,
+//!         ReceiverStep::CheckBroadcast(tx) => {
+//!             let ok = mempool_accepts(&tx).await?;
+//!             session.feed_broadcast_check(ok)?;
+//!         }
+//!         ReceiverStep::ResolveOwned(spks) => {
+//!             let answers = spks.iter().map(|s| wallet.owns(s)).collect();
+//!             session.feed_owned(answers)?;
+//!         }
+//!         ReceiverStep::Contribute => {
+//!             let inputs = wallet.pick_payjoin_inputs()?;
+//!             session.feed_contribute(inputs)?;
+//!         }
+//!         ReceiverStep::SignAndFinalize(mut psbt) => {
+//!             wallet.sign(&mut psbt)?;
+//!             session.feed_signed_psbt(psbt)?;
+//!         }
+//!         ReceiverStep::Done => break,
+//!         ReceiverStep::Failed(e) => return Err(e.into()),
 //!     }
 //! }
 //! ```
@@ -38,8 +57,8 @@ mod sender;
 
 pub use error::Error;
 pub use psbt::restore_psbt_utxos;
-pub use receiver::{ReceiverSession, ReceiverWallet};
-pub use sender::{SenderSession, SenderWallet};
+pub use receiver::{ReceiverSession, ReceiverStep};
+pub use sender::{SenderSession, SenderStep};
 
 // Re-exports so consumers can build the runtime's inputs without a direct
 // `payjoin` dependency.
@@ -49,38 +68,6 @@ pub use payjoin::send::v2::{SenderBuilder, SessionEvent as SenderSessionEvent};
 pub use payjoin::{ImplementationError, OhttpKeys, PjUri, Request, Uri, UriExt};
 
 use bitcoin::FeeRate;
-
-/// Output of [`ReceiverSession::poll`] / [`SenderSession::poll`] — what the
-/// caller should do to drive the state machine forward.
-///
-/// `E` is the role's `SessionEvent` type
-/// ([`ReceiverSessionEvent`] / [`SenderSessionEvent`]).
-#[derive(Debug)]
-pub enum Step<E> {
-    /// Persist these session events atomically before continuing. The events
-    /// represent one logical state advance (typically a `feed_response` ran
-    /// the receiver's 5-stage check ceremony, producing several events in
-    /// sequence). Save them in order, then call `poll` again.
-    ///
-    /// If the session crashes after `Save` is emitted but before the caller
-    /// persists, the session can be recovered by replaying the previously
-    /// saved log via `resume_from_events`.
-    Save(Vec<E>),
-    /// Send this HTTP request, then feed the response body back via
-    /// `feed_response`.
-    SendRequest(Request),
-    /// The directory had no payload yet. Sleep, then call `poll` again. The
-    /// runtime never enforces a specific delay — pick what's appropriate for
-    /// your context (a few seconds is conventional).
-    Backoff,
-    /// The session reached its terminal success state. For the sender, the
-    /// finalized transaction is now available via
-    /// [`SenderSession::final_tx`](crate::SenderSession::final_tx).
-    Done,
-    /// The session failed terminally. Subsequent `poll` calls will return
-    /// [`Error::Terminated`].
-    Failed(Error),
-}
 
 /// Fee-range bounds passed by the receiver to payjoin's `apply_fee_range`.
 ///

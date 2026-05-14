@@ -1,103 +1,100 @@
-//! Receiver-side high-level runtime.
+//! Receiver-side sans-IO state machine.
+//!
+//! Every wallet decision the receiver protocol needs (broadcast suitability,
+//! SPK ownership, contributed inputs, PSBT signing) is surfaced as a
+//! [`ReceiverStep`] variant and answered through the matching `feed_*` method.
+//! The runtime itself never blocks on a wallet call.
 
 use std::sync::{Arc, Mutex};
 
-use bitcoin::{Psbt, Script, Transaction};
+use bitcoin::{OutPoint, Psbt, ScriptBuf, Transaction};
 use payjoin::persist::OptionalTransitionOutcome;
 use payjoin::receive::v2::{
-    replay_event_log, Initialized, PayjoinProposal, ReceiveSession, Receiver, ReceiverBuilder,
-    SessionEvent, SessionOutcome, UncheckedOriginalPayload,
+    replay_event_log, Initialized, MaybeInputsOwned, PayjoinProposal, ProvisionalProposal,
+    ReceiveSession, Receiver, ReceiverBuilder, SessionEvent, SessionOutcome,
+    UncheckedOriginalPayload, WantsInputs,
 };
 use payjoin::receive::InputPair;
-use payjoin::ImplementationError;
+use payjoin::{ImplementationError, Request};
 
 use crate::persister::{Capturing, Replay};
-use crate::{Error, FeeRange, Step};
+use crate::{Error, FeeRange};
 
-/// Wallet capabilities required by [`ReceiverSession`].
+/// What the caller should do next to advance a [`ReceiverSession`].
 ///
-/// Implementors expose the four wallet-aware decisions the receiver makes:
-/// SPK ownership, broadcast suitability of the sender's original transaction,
-/// the set of inputs to contribute, and signing of the proposal PSBT. The
-/// runtime drives everything else — typestate transitions, polling, the
-/// 5-stage check ceremony, finalization.
-pub trait ReceiverWallet {
-    /// Is the given script-pubkey owned by this wallet?
+/// Returned by [`ReceiverSession::poll`]. Each variant has a matching `feed_*`
+/// method that delivers the answer back to the runtime.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum ReceiverStep {
+    /// Persist these session events atomically before continuing.
     ///
-    /// Called by both `check_inputs_not_owned` (to refuse a proposal where the
-    /// sender claims to spend our outputs) and `identify_receiver_outputs` (to
-    /// claim outputs the proposal pays us).
-    fn is_owned(&self, spk: &Script) -> bool;
-
-    /// Decide whether the sender's original transaction would be accepted by
-    /// mempool policy. Typically a `testmempoolaccept` RPC call.
-    fn check_broadcast(&self, tx: &Transaction) -> Result<bool, ImplementationError>;
-
-    /// Produce the inputs to contribute to the payjoin, already shaped as
-    /// payjoin [`InputPair`]s.
-    ///
-    /// Bridge crates (e.g. `bdk_payjoin`) typically provide a helper to build
-    /// these from a wallet's candidate set in one line.
-    fn contribute(&self) -> Result<Vec<InputPair>, Error>;
-
-    /// Sign and finalize this wallet's contributed inputs in the proposal PSBT.
-    ///
-    /// The sender's inputs in the same PSBT will remain unsigned — that's
-    /// expected. The proposal round-trips back to the sender, who completes
-    /// the remaining signatures before broadcast.
-    ///
-    /// # What the runtime has already done for you
-    ///
-    /// Before this is called, the runtime has driven the original PSBT through
-    /// payjoin's full receive-side check ceremony:
-    ///
-    /// - `check_broadcast_suitability` — the sender's original tx would be
-    ///   accepted into mempool ([`check_broadcast`](Self::check_broadcast)).
-    /// - `check_inputs_not_owned` — none of the sender's inputs claim to spend
-    ///   *our* coins ([`is_owned`](Self::is_owned)).
-    /// - `check_no_inputs_seen_before` — replay guard.
-    /// - `identify_receiver_outputs` — outputs paying us are tagged.
-    /// - `contribute_inputs` / `commit_inputs` — the inputs returned by
-    ///   [`contribute`](Self::contribute) have been added to the proposal.
-    /// - `apply_fee_range` — the final feerate sits within the receiver's
-    ///   accepted bounds.
-    ///
-    /// The PSBT handed to this method has the sender's inputs and the
-    /// receiver's contributed inputs in their final positions; only the
-    /// receiver's inputs still need signing.
-    fn process_psbt(&self, psbt: &mut Psbt) -> Result<(), Error>;
+    /// The events represent one logical state advance (e.g. running the full
+    /// post-broadcast check ceremony emits four events in a row). Save them in
+    /// order, then call `poll` again. If the session crashes after `Save` is
+    /// emitted but before the caller persists, recovery is via
+    /// [`ReceiverSession::resume_from_events`].
+    Save(Vec<SessionEvent>),
+    /// Send this HTTP request, then feed the response body back via
+    /// [`ReceiverSession::feed_response`].
+    SendRequest(Request),
+    /// The directory had no payload yet. Sleep, then call `poll` again. The
+    /// runtime never enforces a specific delay — pick what's appropriate for
+    /// your context (a few seconds is conventional).
+    Backoff,
+    /// Decide whether the sender's original transaction would be accepted into
+    /// the mempool (the `testmempoolaccept` semantic). Answer via
+    /// [`ReceiverSession::feed_broadcast_check`].
+    CheckBroadcast(Transaction),
+    /// Decide which of these `script_pubkey`s the receiver owns. The Vec is
+    /// the concatenation of (1) the sender's input prevout `script_pubkey`s
+    /// and (2) the sender's output `script_pubkey`s, in their PSBT order.
+    /// Answer via [`ReceiverSession::feed_owned`] with a Vec of the same
+    /// length and order — `true` means "yes, this is one of mine".
+    ResolveOwned(Vec<ScriptBuf>),
+    /// Provide the inputs the receiver wishes to contribute to the payjoin.
+    /// Answer via [`ReceiverSession::feed_contribute`].
+    Contribute,
+    /// Sign and finalize the receiver's contributed inputs in the proposal
+    /// PSBT. The sender's inputs stay unsigned by design — they will be
+    /// signed by the sender on the round trip. Answer via
+    /// [`ReceiverSession::feed_signed_psbt`].
+    SignAndFinalize(Psbt),
+    /// The session reached its terminal success state — the proposal has been
+    /// posted and the directory acknowledged it.
+    Done,
+    /// The session failed terminally. Subsequent `poll` calls return
+    /// [`Error::Terminated`].
+    Failed(Error),
 }
 
 /// Sans-IO state machine for the payjoin v2 receiver role.
 ///
-/// Drive by alternating [`poll`](Self::poll) (gives you a [`Step`] — what to
-/// do next) and [`feed_response`](Self::feed_response) (consume the directory's
-/// reply). The session terminates with `Step::Done` after publishing the
-/// payjoin proposal back to the directory.
-///
 /// **Persistence.** Every internal payjoin state advance produces one
-/// `SessionEvent`. The runtime buffers events and surfaces them via
-/// [`Step::Save`]; the caller decides where/when/how to persist. To resume
-/// after a crash, replay the saved log via [`Self::resume_from_events`].
-pub struct ReceiverSession<W> {
-    wallet: W,
+/// `SessionEvent`. The runtime buffers them and surfaces them via
+/// [`ReceiverStep::Save`]; the caller decides where/when/how to persist. To
+/// resume after a crash, replay the saved log via
+/// [`Self::resume_from_events`].
+pub struct ReceiverSession {
     fee_range: FeeRange,
     ohttp_relay: String,
     pj_uri: String,
     state: Option<State>,
     events: Arc<Mutex<Vec<SessionEvent>>>,
+    /// Outpoints of the sender's inputs, captured from the original
+    /// transaction as soon as it lands. Used at `NeedSignedPsbt` time to
+    /// identify those inputs in the proposal and clear their stale finalized
+    /// fields before handing the PSBT to the caller for signing (payjoin
+    /// otherwise clears them inside `finalize_proposal`'s callback, which we
+    /// can't piggyback on in the sans-IO flow).
+    sender_input_outpoints: Vec<OutPoint>,
 }
 
-// Variants have naturally different sizes (an `Initialized` session is much
-// smaller than a fully-constructed `PayjoinProposal`), and at most one variant
-// is ever stored at once, so boxing each gains nothing.
+// Variants have naturally different sizes; at most one variant is ever stored
+// at a time so the box-each-variant suggestion buys nothing.
 #[allow(clippy::large_enum_variant)]
 enum State {
-    /// Need to GET-poll the directory for the sender's original PSBT.
-    ///
-    /// `pending_backoff` means the previous poll yielded no payload; the next
-    /// [`poll`](ReceiverSession::poll) call should emit [`Step::Backoff`] once
-    /// before issuing the next request.
+    /// GET-poll the directory for the sender's original PSBT.
     Polling {
         session: Receiver<Initialized>,
         pending_backoff: bool,
@@ -107,7 +104,30 @@ enum State {
         session: Receiver<Initialized>,
         ctx: ohttp::ClientResponse,
     },
-    /// Original PSBT received and processed; ready to POST the proposal.
+    /// Original PSBT received; ask the caller about broadcast suitability.
+    /// The `tx` is cached to avoid re-extracting on every `poll`.
+    NeedBroadcastCheck {
+        session: Receiver<UncheckedOriginalPayload>,
+        tx: Transaction,
+    },
+    /// Broadcast suitability OK; ask the caller about SPK ownership for the
+    /// sender's inputs and outputs in one batch.
+    NeedOwnership {
+        session: Receiver<MaybeInputsOwned>,
+        input_spks: Vec<ScriptBuf>,
+        output_spks: Vec<ScriptBuf>,
+    },
+    /// Outputs identified; ask the caller for inputs to contribute.
+    NeedContribute {
+        session: Receiver<WantsInputs>,
+    },
+    /// Inputs committed and fee-range applied; ask the caller to sign the
+    /// proposal PSBT.
+    NeedSignedPsbt {
+        session: Receiver<ProvisionalProposal>,
+        psbt: Psbt,
+    },
+    /// Proposal finalized; POST it back to the directory.
     Posting(Receiver<PayjoinProposal>),
     /// POST sent; awaiting acknowledgement.
     AwaitingPostAck,
@@ -117,12 +137,11 @@ enum State {
     Failed(Option<Error>),
 }
 
-impl<W: ReceiverWallet> ReceiverSession<W> {
+impl ReceiverSession {
     /// Build a new session.
     pub fn new(
         builder: ReceiverBuilder,
         ohttp_relay: impl Into<String>,
-        wallet: W,
         fee_range: FeeRange,
     ) -> Result<Self, Error> {
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -130,7 +149,6 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
         let session = builder.build().save(&persister).map_err(Error::payjoin)?;
         let pj_uri = session.pj_uri().to_string();
         Ok(Self {
-            wallet,
             fee_range,
             ohttp_relay: ohttp_relay.into(),
             pj_uri,
@@ -139,29 +157,29 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
                 pending_backoff: false,
             }),
             events,
+            sender_input_outpoints: Vec::new(),
         })
     }
 
     /// Resume a session from a previously-persisted event log.
     ///
     /// `events` should be the complete sequence of session events as they were
-    /// recorded from [`Step::Save`], in order. The runtime replays them through
-    /// payjoin's state machine to reconstruct the receiver's current state, then
-    /// continues from there.
+    /// recorded from [`ReceiverStep::Save`], in order. The runtime replays them
+    /// through payjoin's state machine to reconstruct the receiver's current
+    /// state, then continues from there.
     ///
     /// # Atomic-persistence requirement
     ///
-    /// Each `Step::Save` may carry multiple events that represent one logical
-    /// state advance (in particular, processing the sender's original PSBT
-    /// emits 9 events). They must be persisted **atomically as a batch**. If
-    /// the saved log ends partway through such a batch — e.g. it contains
-    /// `CheckedBroadcastSuitability` but not the subsequent events — this
-    /// function returns an error, since the state machine has no clean
-    /// re-entry point in the middle of `process_original`.
+    /// Each `ReceiverStep::Save` may carry multiple events that represent one
+    /// logical state advance — for example, `feed_owned` produces four events
+    /// (`CheckedInputsNotOwned`, `CheckedNoInputsSeenBefore`,
+    /// `IdentifiedReceiverOutputs`, `CommittedOutputs`). They must be
+    /// persisted **atomically as a batch**. If the saved log ends partway
+    /// through such a batch this function returns an error, since the state
+    /// machine has no clean re-entry point in the middle.
     pub fn resume_from_events(
         events: Vec<SessionEvent>,
         ohttp_relay: impl Into<String>,
-        wallet: W,
         fee_range: FeeRange,
     ) -> Result<Self, Error> {
         let persister = Replay::new(events);
@@ -174,29 +192,49 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
                 session: s,
                 pending_backoff: false,
             },
+            ReceiveSession::UncheckedOriginalPayload(s) => {
+                let tx = s.extract_original_tx();
+                State::NeedBroadcastCheck { session: s, tx }
+            }
+            ReceiveSession::MaybeInputsOwned(s) => need_ownership_state(s)?,
+            ReceiveSession::WantsInputs(s) => State::NeedContribute { session: s },
+            // Resuming directly into ProvisionalProposal requires us to know
+            // which inputs are the receiver's so we can clear the sender's
+            // stale finalized fields before surfacing the PSBT for signing —
+            // but with only a public typestate view we cannot reconstruct that
+            // partition from this typestate. Refuse this resume target until
+            // upstream exposes either the original tx or the sender-input
+            // outpoints on `Receiver<ProvisionalProposal>`.
+            ReceiveSession::ProvisionalProposal(_) => {
+                return Err(Error::Payjoin(
+                    "cannot resume directly into ProvisionalProposal yet; \
+                     re-run from an earlier event-log checkpoint"
+                        .into(),
+                ));
+            }
             ReceiveSession::PayjoinProposal(s) => State::Posting(s),
             ReceiveSession::Closed(SessionOutcome::Success(_)) => State::Done,
             ReceiveSession::Closed(outcome) => State::Failed(Some(Error::Payjoin(format!(
                 "session previously closed: {outcome:?}"
             )))),
-            // Any other variant means the event log ended mid-`process_original`,
-            // violating the atomic-persistence requirement. We refuse to resume
-            // because the state machine has no clean re-entry point.
+            // Any other variant means the event log ended mid-batch. The
+            // state machine has no clean re-entry point inside a `feed_*`
+            // sequence, so refuse.
             other => {
                 return Err(Error::Payjoin(format!(
                     "cannot resume from intermediate state {other:?}; event log was not \
-                     persisted atomically per `Step::Save` batch"
+                     persisted atomically per `ReceiverStep::Save` batch"
                 )));
             }
         };
 
         Ok(Self {
-            wallet,
             fee_range,
             ohttp_relay: ohttp_relay.into(),
             pj_uri,
             state: Some(state),
             events: Arc::new(Mutex::new(Vec::new())),
+            sender_input_outpoints: Vec::new(),
         })
     }
 
@@ -205,23 +243,18 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
         &self.pj_uri
     }
 
-    /// Consume the session and return the wallet adapter.
-    pub fn into_wallet(self) -> W {
-        self.wallet
-    }
-
     /// Advance the state machine and report what the caller should do next.
-    pub fn poll(&mut self) -> Step<SessionEvent> {
+    pub fn poll(&mut self) -> ReceiverStep {
         // Drain any captured events first — the caller must persist them
         // before we issue any further side-effecting requests.
         let drained = self.drain_events();
         if !drained.is_empty() {
-            return Step::Save(drained);
+            return ReceiverStep::Save(drained);
         }
 
         let state = match self.state.take() {
             Some(s) => s,
-            None => return Step::Failed(Error::Terminated),
+            None => return ReceiverStep::Failed(Error::Terminated),
         };
         let (next, step) = self.step(state);
         self.state = Some(next);
@@ -229,10 +262,97 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
     }
 
     /// Feed back the body of the directory response from the most recent
-    /// `Step::SendRequest`.
+    /// `ReceiverStep::SendRequest`.
     pub fn feed_response(&mut self, bytes: Vec<u8>) -> Result<(), Error> {
         let state = self.state.take().ok_or(Error::Terminated)?;
-        let next = self.consume(state, bytes);
+        let next = self.consume_response(state, bytes);
+        self.state = Some(next);
+        Ok(())
+    }
+
+    /// Feed back the broadcast-suitability decision from
+    /// `ReceiverStep::CheckBroadcast`.
+    pub fn feed_broadcast_check(&mut self, ok: bool) -> Result<(), Error> {
+        let state = self.state.take().ok_or(Error::Terminated)?;
+        let next = match state {
+            State::NeedBroadcastCheck { session, tx } => {
+                // Capture the sender's input outpoints from the original tx
+                // — we'll need them later to clear stale finalized fields on
+                // the proposal PSBT before surfacing it for signing.
+                self.sender_input_outpoints =
+                    tx.input.iter().map(|i| i.previous_output).collect();
+                self.advance_broadcast(session, ok)
+            }
+            other => {
+                self.state = Some(other);
+                return Err(Error::Payjoin(
+                    "feed_broadcast_check called in an unexpected state".into(),
+                ));
+            }
+        };
+        self.state = Some(next);
+        Ok(())
+    }
+
+    /// Feed back the ownership decisions for the `ReceiverStep::ResolveOwned`
+    /// SPK list. `answers` must have the same length as the SPK list and align
+    /// index-for-index.
+    pub fn feed_owned(&mut self, answers: Vec<bool>) -> Result<(), Error> {
+        let state = self.state.take().ok_or(Error::Terminated)?;
+        let next = match state {
+            State::NeedOwnership { session, input_spks, output_spks } => {
+                let expected = input_spks.len() + output_spks.len();
+                if answers.len() != expected {
+                    self.state = Some(State::NeedOwnership { session, input_spks, output_spks });
+                    return Err(Error::Wallet(format!(
+                        "feed_owned: expected {expected} answers, got {}",
+                        answers.len()
+                    )));
+                }
+                let (input_answers, output_answers) = answers.split_at(input_spks.len());
+                self.advance_ownership(session, input_answers, output_answers)
+            }
+            other => {
+                self.state = Some(other);
+                return Err(Error::Payjoin(
+                    "feed_owned called in an unexpected state".into(),
+                ));
+            }
+        };
+        self.state = Some(next);
+        Ok(())
+    }
+
+    /// Feed back the inputs to contribute from `ReceiverStep::Contribute`.
+    pub fn feed_contribute(&mut self, inputs: Vec<InputPair>) -> Result<(), Error> {
+        let state = self.state.take().ok_or(Error::Terminated)?;
+        let next = match state {
+            State::NeedContribute { session } => self.advance_contribute(session, inputs),
+            other => {
+                self.state = Some(other);
+                return Err(Error::Payjoin(
+                    "feed_contribute called in an unexpected state".into(),
+                ));
+            }
+        };
+        self.state = Some(next);
+        Ok(())
+    }
+
+    /// Feed back the signed-and-finalized PSBT from
+    /// `ReceiverStep::SignAndFinalize`. The receiver's own inputs must be
+    /// signed and finalized; the sender's inputs stay unsigned by design.
+    pub fn feed_signed_psbt(&mut self, psbt: Psbt) -> Result<(), Error> {
+        let state = self.state.take().ok_or(Error::Terminated)?;
+        let next = match state {
+            State::NeedSignedPsbt { session, .. } => self.advance_finalize(session, psbt),
+            other => {
+                self.state = Some(other);
+                return Err(Error::Payjoin(
+                    "feed_signed_psbt called in an unexpected state".into(),
+                ));
+            }
+        };
         self.state = Some(next);
         Ok(())
     }
@@ -249,46 +369,62 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
         Capturing::new(self.events.clone())
     }
 
-    fn step(&self, state: State) -> (State, Step<SessionEvent>) {
+    fn step(&self, state: State) -> (State, ReceiverStep) {
         match state {
-            State::Polling {
-                session,
-                pending_backoff: true,
-            } => (
-                State::Polling {
-                    session,
-                    pending_backoff: false,
-                },
-                Step::Backoff,
+            State::Polling { session, pending_backoff: true } => (
+                State::Polling { session, pending_backoff: false },
+                ReceiverStep::Backoff,
             ),
-            State::Polling {
-                session,
-                pending_backoff: false,
-            } => match session.create_poll_request(self.ohttp_relay.as_str()) {
-                Ok((req, ctx)) => (State::AwaitingPoll { session, ctx }, Step::SendRequest(req)),
-                Err(e) => (State::Failed(None), Step::Failed(Error::payjoin(e))),
-            },
+            State::Polling { session, pending_backoff: false } => {
+                match session.create_poll_request(self.ohttp_relay.as_str()) {
+                    Ok((req, ctx)) => (
+                        State::AwaitingPoll { session, ctx },
+                        ReceiverStep::SendRequest(req),
+                    ),
+                    Err(e) => (State::Failed(None), ReceiverStep::Failed(Error::payjoin(e))),
+                }
+            }
+            State::NeedBroadcastCheck { session, tx } => (
+                State::NeedBroadcastCheck { session, tx: tx.clone() },
+                ReceiverStep::CheckBroadcast(tx),
+            ),
+            State::NeedOwnership { session, input_spks, output_spks } => {
+                let combined: Vec<ScriptBuf> =
+                    input_spks.iter().chain(output_spks.iter()).cloned().collect();
+                (
+                    State::NeedOwnership { session, input_spks, output_spks },
+                    ReceiverStep::ResolveOwned(combined),
+                )
+            }
+            State::NeedContribute { session } => (
+                State::NeedContribute { session },
+                ReceiverStep::Contribute,
+            ),
+            State::NeedSignedPsbt { session, psbt } => (
+                State::NeedSignedPsbt { session, psbt: psbt.clone() },
+                ReceiverStep::SignAndFinalize(psbt),
+            ),
             State::Posting(proposal) => {
                 match proposal.create_post_request(self.ohttp_relay.as_str()) {
-                    Ok((req, _ctx)) => (State::AwaitingPostAck, Step::SendRequest(req)),
-                    Err(e) => (State::Failed(None), Step::Failed(Error::payjoin(e))),
+                    Ok((req, _ctx)) => (State::AwaitingPostAck, ReceiverStep::SendRequest(req)),
+                    Err(e) => (State::Failed(None), ReceiverStep::Failed(Error::payjoin(e))),
                 }
             }
             State::AwaitingPoll { .. } | State::AwaitingPostAck => (
                 state,
-                Step::Failed(Error::Payjoin(
+                ReceiverStep::Failed(Error::Payjoin(
                     "called poll() while awaiting a response".into(),
                 )),
             ),
-            State::Done => (State::Done, Step::Done),
+            State::Done => (State::Done, ReceiverStep::Done),
             State::Failed(opt) => {
                 let err = opt.unwrap_or(Error::Terminated);
-                (State::Failed(None), Step::Failed(err))
+                (State::Failed(None), ReceiverStep::Failed(err))
             }
         }
     }
 
-    fn consume(&self, state: State, bytes: Vec<u8>) -> State {
+    fn consume_response(&self, state: State, bytes: Vec<u8>) -> State {
         match state {
             State::AwaitingPoll { session, ctx } => {
                 let persister = self.persister();
@@ -302,10 +438,8 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
                         pending_backoff: true,
                     },
                     OptionalTransitionOutcome::Progress(unchecked) => {
-                        match self.process_original(unchecked) {
-                            Ok(proposal) => State::Posting(proposal),
-                            Err(e) => State::Failed(Some(e)),
-                        }
+                        let tx = unchecked.extract_original_tx();
+                        State::NeedBroadcastCheck { session: unchecked, tx }
                     }
                 }
             }
@@ -316,61 +450,176 @@ impl<W: ReceiverWallet> ReceiverSession<W> {
         }
     }
 
-    fn process_original(
+    fn advance_broadcast(
         &self,
-        unchecked: Receiver<UncheckedOriginalPayload>,
-    ) -> Result<Receiver<PayjoinProposal>, Error> {
+        session: Receiver<UncheckedOriginalPayload>,
+        ok: bool,
+    ) -> State {
         let persister = self.persister();
-        let wallet = &self.wallet;
-
-        let p = unchecked
-            .check_broadcast_suitability(None, |tx| wallet.check_broadcast(tx))
+        let maybe_inputs_owned = match session
+            .check_broadcast_suitability(self.fee_range.min, |_| Ok(ok))
             .save(&persister)
-            .map_err(Error::payjoin)?;
-        let p = p
-            .check_inputs_not_owned(&mut |spk| Ok(wallet.is_owned(spk)))
-            .save(&persister)
-            .map_err(Error::payjoin)?;
-        let p = p
-            .check_no_inputs_seen_before(&mut |_| Ok(false))
-            .save(&persister)
-            .map_err(Error::payjoin)?;
-        let p = p
-            .identify_receiver_outputs(&mut |spk| Ok(wallet.is_owned(spk)))
-            .save(&persister)
-            .map_err(Error::payjoin)?;
-        let p = p.commit_outputs().save(&persister).map_err(Error::payjoin)?;
-
-        let inputs = wallet.contribute()?;
-        if inputs.is_empty() {
-            return Err(Error::Wallet("no candidate inputs to contribute".into()));
+        {
+            Ok(s) => s,
+            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+        };
+        match need_ownership_state(maybe_inputs_owned) {
+            Ok(state) => state,
+            Err(e) => State::Failed(Some(e)),
         }
-        let selected = p
-            .try_preserving_privacy(inputs)
-            .map_err(|e| Error::Payjoin(format!("privacy-preserving selection: {e:?}")))?;
-        let p = p
-            .contribute_inputs(vec![selected])
-            .map_err(|e| Error::Payjoin(format!("contribute_inputs: {e:?}")))?
-            .commit_inputs()
-            .save(&persister)
-            .map_err(Error::payjoin)?;
+    }
 
-        let p = p
-            .apply_fee_range(self.fee_range.min, self.fee_range.max)
-            .save(&persister)
-            .map_err(Error::payjoin)?;
-
-        let p = p
-            .finalize_proposal(|psbt: &Psbt| {
-                let mut psbt = psbt.clone();
-                wallet
-                    .process_psbt(&mut psbt)
-                    .map_err(|e| ImplementationError::from(e.to_string().as_str()))?;
-                Ok(psbt)
+    fn advance_ownership(
+        &self,
+        session: Receiver<MaybeInputsOwned>,
+        input_answers: &[bool],
+        output_answers: &[bool],
+    ) -> State {
+        let persister = self.persister();
+        let input_idx = std::cell::Cell::new(0usize);
+        let inputs_seen = match session
+            .check_inputs_not_owned(&mut |_spk| {
+                let i = input_idx.get();
+                input_idx.set(i + 1);
+                Ok(input_answers[i])
             })
             .save(&persister)
-            .map_err(Error::payjoin)?;
+        {
+            Ok(s) => s,
+            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+        };
 
-        Ok(p)
+        let outputs_unknown = match inputs_seen
+            .check_no_inputs_seen_before(&mut |_| Ok(false))
+            .save(&persister)
+        {
+            Ok(s) => s,
+            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+        };
+
+        let output_idx = std::cell::Cell::new(0usize);
+        let wants_outputs = match outputs_unknown
+            .identify_receiver_outputs(&mut |_spk| {
+                let i = output_idx.get();
+                output_idx.set(i + 1);
+                Ok(output_answers[i])
+            })
+            .save(&persister)
+        {
+            Ok(s) => s,
+            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+        };
+
+        let wants_inputs = match wants_outputs.commit_outputs().save(&persister) {
+            Ok(s) => s,
+            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+        };
+
+        State::NeedContribute { session: wants_inputs }
+    }
+
+    fn advance_contribute(
+        &self,
+        session: Receiver<WantsInputs>,
+        inputs: Vec<InputPair>,
+    ) -> State {
+        if inputs.is_empty() {
+            return State::Failed(Some(Error::Wallet(
+                "no candidate inputs to contribute".into(),
+            )));
+        }
+        let selected = match session.try_preserving_privacy(inputs) {
+            Ok(s) => s,
+            Err(e) => {
+                return State::Failed(Some(Error::Payjoin(format!(
+                    "privacy-preserving selection: {e:?}"
+                ))))
+            }
+        };
+        let session = match session.contribute_inputs(vec![selected]) {
+            Ok(s) => s,
+            Err(e) => {
+                return State::Failed(Some(Error::Payjoin(format!("contribute_inputs: {e:?}"))))
+            }
+        };
+        let persister = self.persister();
+        let wants_fee_range = match session.commit_inputs().save(&persister) {
+            Ok(s) => s,
+            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+        };
+        let provisional = match wants_fee_range
+            .apply_fee_range(self.fee_range.min, self.fee_range.max)
+            .save(&persister)
+        {
+            Ok(s) => s,
+            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+        };
+        let mut psbt = provisional.psbt_to_sign();
+        // Sender inputs in the proposal still carry their pre-payjoin
+        // finalization (the original PSBT arrived already signed). Payjoin
+        // itself clears these inside `finalize_proposal`'s callback, but in
+        // the sans-IO flow the caller signs *outside* that callback — so we
+        // must clear them ourselves before surfacing the PSBT for signing.
+        // Otherwise the caller signs a PSBT that still claims the sender's
+        // inputs are finalized, and the sender rejects the proposal as
+        // `SenderTxinContainsFinalScriptSig`.
+        clear_sender_finalization(&mut psbt, &self.sender_input_outpoints);
+        State::NeedSignedPsbt { session: provisional, psbt }
+    }
+
+    fn advance_finalize(
+        &self,
+        session: Receiver<ProvisionalProposal>,
+        signed: Psbt,
+    ) -> State {
+        let persister = self.persister();
+        let finalized = match session
+            .finalize_proposal(|_psbt| Ok(signed.clone()))
+            .save(&persister)
+        {
+            Ok(s) => s,
+            Err(e) => return State::Failed(Some(Error::payjoin(e))),
+        };
+        State::Posting(finalized)
     }
 }
+
+/// Mirror payjoin's internal sender-signature clearing: any PSBT input whose
+/// `previous_output` is in `sender_outpoints` is part of the sender's original
+/// (signed) transaction, and its stale `final_script_sig` / `final_script_witness`
+/// / `tap_key_sig` must be removed before the receiver signs and finalizes its
+/// own contributed inputs.
+fn clear_sender_finalization(psbt: &mut Psbt, sender_outpoints: &[OutPoint]) {
+    for (txin, psbtin) in psbt.unsigned_tx.input.iter().zip(psbt.inputs.iter_mut()) {
+        if sender_outpoints.contains(&txin.previous_output) {
+            psbtin.final_script_sig = None;
+            psbtin.final_script_witness = None;
+            psbtin.tap_key_sig = None;
+        }
+    }
+}
+
+/// Compute the [`State::NeedOwnership`] payload for a given
+/// `Receiver<MaybeInputsOwned>` — pre-enumerate the input and output SPKs the
+/// caller will be asked about so a single round-trip covers both.
+fn need_ownership_state(session: Receiver<MaybeInputsOwned>) -> Result<State, Error> {
+    let input_spks = session
+        .sender_input_script_pubkeys()
+        .map_err(Error::payjoin)?;
+    let tx = session.extract_tx_to_schedule_broadcast();
+    let output_spks: Vec<ScriptBuf> = tx
+        .output
+        .iter()
+        .map(|txout| txout.script_pubkey.clone())
+        .collect();
+    Ok(State::NeedOwnership {
+        session,
+        input_spks,
+        output_spks,
+    })
+}
+
+// Suppress the unused-import warning for ImplementationError on builds where
+// no caller-facing path uses it; it's still part of `payjoin`'s public surface
+// we hand back through `Error::payjoin`.
+const _: fn(ImplementationError) = |_| {};
