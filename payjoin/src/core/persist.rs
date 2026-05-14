@@ -5,6 +5,33 @@
 //! means that the session's full state can be computed by "replaying" the events.
 //! Session history is therefore a recorded as an append only log of events.
 //!
+//! # Two APIs: persister callback vs sans-IO deconstruct
+//!
+//! Every state-transition object exposes two ways to consume it:
+//!
+//! - **`save(&persister)` / `save_async(&persister)`** — pass in something that
+//!   implements [`SessionPersister`] (or [`AsyncSessionPersister`]) and the
+//!   library appends the resulting event for you. Convenient when the caller
+//!   already has a persister object handy and is happy to block on its
+//!   `save_event` call inline.
+//!
+//! - **`deconstruct()`** — returns the [`PersistAction`] and the next-state
+//!   outcome as plain data. The caller decides when and how to persist (write
+//!   it to disk now, batch it with sibling events, forward it to another task,
+//!   discard it for a dry run, etc.). This is the right entry point for
+//!   sans-IO drivers that don't want the library reaching into a callback at
+//!   transition time.
+//!
+//! ```ignore
+//! let (action, outcome) = transition.deconstruct();
+//! match action {
+//!     PersistAction::Save(event) => buffer.push(event),
+//!     PersistAction::SaveAndClose(event) => { buffer.push(event); closed = true; }
+//!     PersistAction::NoOp => {}
+//! }
+//! let next_state = outcome?; // proceed with the new state, or branch on ApiError
+//! ```
+//!
 //! # Backwards and forwards compatibility
 //!
 //! If any new fields are added to events, backwards compatibility must be
@@ -24,17 +51,26 @@
 
 use std::fmt;
 
-/// Representation of the actions that the persister should take, if any.
-pub(crate) enum PersistActions<Event> {
-    /// Do nothing.
+/// The persistence side effect produced by a state transition.
+///
+/// Returned by each transition type's [`deconstruct`](MaybeFatalTransition::deconstruct)-style
+/// method so sans-IO callers can choose **when** to persist (and how) without
+/// going through a [`SessionPersister`] callback. The matching
+/// [`save`](MaybeFatalTransition::save) / `save_async` methods just route this
+/// action through a `SessionPersister` for callers that prefer the trait-based
+/// API.
+#[derive(Debug)]
+pub enum PersistAction<Event> {
+    /// No persistence is required for this transition (typically a transient
+    /// error or a no-op stasis).
     NoOp,
-    /// Save an event.
+    /// Append this event to the session log.
     Save(Event),
-    /// Save an event and close the session.
+    /// Append this event to the session log, then mark the session closed.
     SaveAndClose(Event),
 }
 
-impl<Event> PersistActions<Event> {
+impl<Event> PersistAction<Event> {
     pub fn execute<P>(self, persister: &P) -> Result<(), P::InternalStorageError>
     where
         P: SessionPersister<SessionEvent = Event>,
@@ -98,25 +134,25 @@ where
     }
 
     #[allow(clippy::type_complexity)]
-    pub(crate) fn deconstruct(
+    pub fn deconstruct(
         self,
     ) -> (
-        PersistActions<Event>,
+        PersistAction<Event>,
         Result<OptionalTransitionOutcome<SuccessValue, CurrentState>, ApiError<Err>>,
     ) {
         match self.0 {
             Ok(AcceptOptionalTransition::Success(AcceptNextState(event, success_value))) => (
-                PersistActions::SaveAndClose(event),
+                PersistAction::SaveAndClose(event),
                 Ok(OptionalTransitionOutcome::Progress(success_value)),
             ),
             Ok(AcceptOptionalTransition::NoResults(current_state)) =>
-                (PersistActions::NoOp, Ok(OptionalTransitionOutcome::Stasis(current_state))),
+                (PersistAction::NoOp, Ok(OptionalTransitionOutcome::Stasis(current_state))),
             Err(Rejection::Fatal(RejectFatal(event, error))) =>
-                (PersistActions::SaveAndClose(event), Err(ApiError::Fatal(error))),
+                (PersistAction::SaveAndClose(event), Err(ApiError::Fatal(error))),
             Err(Rejection::Transient(RejectTransient(error))) =>
-                (PersistActions::NoOp, Err(ApiError::Transient(error))),
+                (PersistAction::NoOp, Err(ApiError::Transient(error))),
             Err(Rejection::ReplyableError(RejectReplyableError(event, _, error))) =>
-                (PersistActions::Save(event), Err(ApiError::Fatal(error))),
+                (PersistAction::Save(event), Err(ApiError::Fatal(error))),
         }
     }
 
@@ -184,23 +220,23 @@ where
     }
 
     #[allow(clippy::type_complexity)]
-    pub(crate) fn deconstruct(
+    pub fn deconstruct(
         self,
     ) -> (
-        PersistActions<Event>,
+        PersistAction<Event>,
         Result<OptionalTransitionOutcome<NextState, CurrentState>, ApiError<Err>>,
     ) {
         match self.0 {
             Ok(AcceptOptionalTransition::Success(AcceptNextState(event, next_state))) =>
-                (PersistActions::Save(event), Ok(OptionalTransitionOutcome::Progress(next_state))),
+                (PersistAction::Save(event), Ok(OptionalTransitionOutcome::Progress(next_state))),
             Ok(AcceptOptionalTransition::NoResults(current_state)) =>
-                (PersistActions::NoOp, Ok(OptionalTransitionOutcome::Stasis(current_state))),
+                (PersistAction::NoOp, Ok(OptionalTransitionOutcome::Stasis(current_state))),
             Err(Rejection::Fatal(RejectFatal(event, error))) =>
-                (PersistActions::SaveAndClose(event), Err(ApiError::Fatal(error))),
+                (PersistAction::SaveAndClose(event), Err(ApiError::Fatal(error))),
             Err(Rejection::Transient(RejectTransient(error))) =>
-                (PersistActions::NoOp, Err(ApiError::Transient(error))),
+                (PersistAction::NoOp, Err(ApiError::Transient(error))),
             Err(Rejection::ReplyableError(RejectReplyableError(event, _, error))) =>
-                (PersistActions::Save(event), Err(ApiError::Fatal(error))),
+                (PersistAction::Save(event), Err(ApiError::Fatal(error))),
         }
     }
 
@@ -265,17 +301,17 @@ where
         MaybeFatalTransition(Err(Rejection::replyable_error(event, error_state, error)))
     }
 
-    pub(crate) fn deconstruct(
+    pub fn deconstruct(
         self,
-    ) -> (PersistActions<Event>, Result<NextState, ApiError<Err, ErrorState>>) {
+    ) -> (PersistAction<Event>, Result<NextState, ApiError<Err, ErrorState>>) {
         match self.0 {
-            Ok(AcceptNextState(event, next_state)) => (PersistActions::Save(event), Ok(next_state)),
+            Ok(AcceptNextState(event, next_state)) => (PersistAction::Save(event), Ok(next_state)),
             Err(Rejection::Fatal(RejectFatal(event, error))) =>
-                (PersistActions::SaveAndClose(event), Err(ApiError::Fatal(error))),
+                (PersistAction::SaveAndClose(event), Err(ApiError::Fatal(error))),
             Err(Rejection::Transient(RejectTransient(error))) =>
-                (PersistActions::NoOp, Err(ApiError::Transient(error))),
+                (PersistAction::NoOp, Err(ApiError::Transient(error))),
             Err(Rejection::ReplyableError(RejectReplyableError(event, error_state, error))) =>
-                (PersistActions::Save(event), Err(ApiError::FatalWithState(error, error_state))),
+                (PersistAction::Save(event), Err(ApiError::FatalWithState(error, error_state))),
         }
     }
 
@@ -326,10 +362,10 @@ where
         MaybeTransientTransition(Err(RejectTransient(error)))
     }
 
-    pub(crate) fn deconstruct(self) -> (PersistActions<Event>, Result<NextState, ApiError<Err>>) {
+    pub fn deconstruct(self) -> (PersistAction<Event>, Result<NextState, ApiError<Err>>) {
         match self.0 {
-            Ok(AcceptNextState(event, next_state)) => (PersistActions::Save(event), Ok(next_state)),
-            Err(RejectTransient(error)) => (PersistActions::NoOp, Err(ApiError::Transient(error))),
+            Ok(AcceptNextState(event, next_state)) => (PersistAction::Save(event), Ok(next_state)),
+            Err(RejectTransient(error)) => (PersistAction::NoOp, Err(ApiError::Transient(error))),
         }
     }
 
@@ -383,18 +419,16 @@ where
         MaybeSuccessTransition(Err(Rejection::fatal(event, error)))
     }
 
-    pub(crate) fn deconstruct(
-        self,
-    ) -> (PersistActions<Event>, Result<SuccessValue, ApiError<Err>>) {
+    pub fn deconstruct(self) -> (PersistAction<Event>, Result<SuccessValue, ApiError<Err>>) {
         match self.0 {
             Ok(AcceptNextState(event, success_value)) =>
-                (PersistActions::SaveAndClose(event), Ok(success_value)),
+                (PersistAction::SaveAndClose(event), Ok(success_value)),
             Err(Rejection::Transient(RejectTransient(error))) =>
-                (PersistActions::NoOp, Err(ApiError::Transient(error))),
+                (PersistAction::NoOp, Err(ApiError::Transient(error))),
             Err(Rejection::Fatal(RejectFatal(event, error))) =>
-                (PersistActions::SaveAndClose(event), Err(ApiError::Fatal(error))),
+                (PersistAction::SaveAndClose(event), Err(ApiError::Fatal(error))),
             Err(Rejection::ReplyableError(RejectReplyableError(event, _, error))) =>
-                (PersistActions::Save(event), Err(ApiError::Fatal(error))),
+                (PersistAction::Save(event), Err(ApiError::Fatal(error))),
         }
     }
 
@@ -434,9 +468,9 @@ impl<Event, NextState> NextStateTransition<Event, NextState> {
         NextStateTransition(AcceptNextState(event, next_state))
     }
 
-    pub(crate) fn deconstruct(self) -> (PersistActions<Event>, NextState) {
+    pub fn deconstruct(self) -> (PersistAction<Event>, NextState) {
         let AcceptNextState(event, next_state) = self.0;
-        (PersistActions::Save(event), next_state)
+        (PersistAction::Save(event), next_state)
     }
 
     pub fn save<P>(self, persister: &P) -> Result<NextState, P::InternalStorageError>
@@ -475,12 +509,22 @@ pub struct TerminalTransition<Event, T>(Event, T);
 impl<Event, T> TerminalTransition<Event, T> {
     pub(crate) fn new(event: Event, value: T) -> Self { Self(event, value) }
 
+    /// Decompose the transition into its persistence action and outcome value.
+    ///
+    /// This is the sans-IO entry point — see the [module docs](crate::persist)
+    /// for the pattern. The persistence action for a terminal transition is
+    /// always [`PersistAction::SaveAndClose`].
+    pub fn deconstruct(self) -> (PersistAction<Event>, T) {
+        (PersistAction::SaveAndClose(self.0), self.1)
+    }
+
     pub fn save<P>(self, persister: &P) -> Result<T, P::InternalStorageError>
     where
         P: SessionPersister<SessionEvent = Event>,
     {
-        PersistActions::SaveAndClose(self.0).execute(persister)?;
-        Ok(self.1)
+        let (action, value) = self.deconstruct();
+        action.execute(persister)?;
+        Ok(value)
     }
 
     pub async fn save_async<P>(self, persister: &P) -> Result<T, P::InternalStorageError>
@@ -489,8 +533,9 @@ impl<Event, T> TerminalTransition<Event, T> {
         Event: Send,
         T: Send,
     {
-        PersistActions::SaveAndClose(self.0).execute_async(persister).await?;
-        Ok(self.1)
+        let (action, value) = self.deconstruct();
+        action.execute_async(persister).await?;
+        Ok(value)
     }
 }
 
@@ -523,19 +568,19 @@ where
     }
 
     #[allow(clippy::type_complexity)]
-    pub(crate) fn deconstruct(
+    pub fn deconstruct(
         self,
-    ) -> (PersistActions<Event>, Result<OptionalTransitionOutcome<(), CurrentState>, ApiError<Err>>)
+    ) -> (PersistAction<Event>, Result<OptionalTransitionOutcome<(), CurrentState>, ApiError<Err>>)
     {
         match self {
             MaybeFatalOrSuccessTransition::Success(event) =>
-                (PersistActions::SaveAndClose(event), Ok(OptionalTransitionOutcome::Progress(()))),
+                (PersistAction::SaveAndClose(event), Ok(OptionalTransitionOutcome::Progress(()))),
             MaybeFatalOrSuccessTransition::NoResults(current_state) =>
-                (PersistActions::NoOp, Ok(OptionalTransitionOutcome::Stasis(current_state))),
+                (PersistAction::NoOp, Ok(OptionalTransitionOutcome::Stasis(current_state))),
             MaybeFatalOrSuccessTransition::Transient(RejectTransient(error)) =>
-                (PersistActions::NoOp, Err(ApiError::Transient(error))),
+                (PersistAction::NoOp, Err(ApiError::Transient(error))),
             MaybeFatalOrSuccessTransition::Fatal(RejectFatal(event, error)) =>
-                (PersistActions::SaveAndClose(event), Err(ApiError::Fatal(error))),
+                (PersistAction::SaveAndClose(event), Err(ApiError::Fatal(error))),
         }
     }
 
@@ -708,13 +753,27 @@ impl<ApiErr: std::error::Error, StorageError: std::error::Error, ErrorState: fmt
     }
 }
 
+/// The error half of a transition's outcome.
+///
+/// Returned by each transition type's `deconstruct`-style method so sans-IO
+/// callers can distinguish retry-able failures from terminal ones without
+/// going through a [`SessionPersister`].
 #[derive(Debug)]
-pub(crate) enum ApiError<Err, ErrorState = ()> {
-    /// Error indicating that the session should be retried from the same state
+pub enum ApiError<Err, ErrorState = ()> {
+    /// The transition failed transiently; the caller may retry from the same
+    /// state. No event needs to be persisted.
     Transient(Err),
-    /// Error indicating that the session is terminally closed
+    /// The transition failed terminally and the session is closed. The
+    /// accompanying [`PersistAction`] will typically be a [`SaveAndClose`].
+    ///
+    /// [`SaveAndClose`]: PersistAction::SaveAndClose
     Fatal(Err),
-    /// Fatal error that results in a state transition to ErrorState
+    /// The transition failed terminally but transitioned to an error state
+    /// the counterparty must be informed of (e.g. the receiver's
+    /// `HasReplyableError`). The accompanying [`PersistAction`] will be a
+    /// [`Save`].
+    ///
+    /// [`Save`]: PersistAction::Save
     FatalWithState(Err, ErrorState),
 }
 
@@ -1446,5 +1505,31 @@ mod tests {
         );
         assert!(transient_error.storage_error_ref().is_none());
         assert!(transient_error.api_error_ref().is_some());
+    }
+
+    /// Demonstrates the sans-IO entry point: `deconstruct` returns the
+    /// persistence action as data, leaving the caller in control of when (and
+    /// whether) to commit it. The equivalent `.save(&persister)` would have
+    /// fired into the persister callback inline.
+    #[test]
+    fn deconstruct_exposes_event_as_data_for_sans_io_callers() {
+        let event = InMemoryTestEvent("foo".to_string());
+        let next_state = "Next state".to_string();
+
+        // Success path: NextStateTransition emits Save(event) + the next state.
+        let transition = NextStateTransition::success(event.clone(), next_state.clone());
+        let (action, observed_next) = transition.deconstruct();
+        match action {
+            PersistAction::Save(saved) => assert_eq!(saved.0, event.0),
+            other => panic!("expected Save(event), got {other:?}"),
+        }
+        assert_eq!(observed_next, next_state);
+
+        // Transient path on a fallible transition: NoOp + ApiError::Transient.
+        let transition: MaybeTransientTransition<InMemoryTestEvent, (), InMemoryTestError> =
+            MaybeTransientTransition::transient(InMemoryTestError {});
+        let (action, outcome) = transition.deconstruct();
+        assert!(matches!(action, PersistAction::NoOp));
+        assert!(matches!(outcome, Err(ApiError::Transient(_))));
     }
 }
