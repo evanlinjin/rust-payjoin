@@ -256,11 +256,14 @@ impl<State> Sender<State> {
 impl<S: State> Sender<S> {
     /// Cancel the Payjoin session immediately.
     ///
-    /// Returns a [`TerminalTransition`] that, once persisted, yields the fallback
-    /// transaction. The fallback transaction is the sender's original transaction that
-    /// should be broadcast to complete the payment without Payjoin.
+    /// Pushes a `Closed(Cancel)` event into `buf` and returns the sender's
+    /// fallback transaction. The fallback transaction is the sender's
+    /// original transaction that should be broadcast to complete the payment
+    /// without Payjoin.
     ///
-    /// This is a terminal transition — the session cannot be used after cancellation.
+    /// This is a terminal action — the session cannot be used after
+    /// cancellation. The caller is expected to drain `buf` through their
+    /// storage and treat the `Closed` event as the session boundary.
     pub fn cancel(self, buf: &mut EventBuffer<SessionEvent>) -> bitcoin::Transaction {
         let fallback =
             self.session_context.psbt_ctx.original_psbt.clone().extract_tx_unchecked_fee_rate();

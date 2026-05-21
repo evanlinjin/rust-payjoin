@@ -132,7 +132,7 @@ void main() {
       final persister = InMemoryReceiverPersister();
       _buildReceiver("tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4", persister);
 
-      final result = payjoin.replayReceiverEventLog(events: persister.load());
+      final result = payjoin.replayReceiverEventLog(events: parseReceiverEvents(persister.load()));
       expect(
         result.state(),
         isA<payjoin.InitializedReceiveSession>(),
@@ -154,7 +154,7 @@ void main() {
       _buildSender(psbt, uri, sendPersister, sendBuf);
 
       final senderResult = payjoin.replaySenderEventLog(
-        events: sendPersister.load(),
+        events: parseSenderEvents(sendPersister.load()),
       );
       expect(
         senderResult.state(),
@@ -177,7 +177,7 @@ void main() {
       persister.drain(built.buf);
       expect(fallbackTx, isNull);
 
-      final result = payjoin.replayReceiverEventLog(events: persister.load());
+      final result = payjoin.replayReceiverEventLog(events: parseReceiverEvents(persister.load()));
       expect(
         result.state(),
         isA<payjoin.ClosedReceiveSession>(),
@@ -197,7 +197,7 @@ void main() {
       expect(fallbackTx, isNull);
 
       final events = await persister.load();
-      final result = payjoin.replayReceiverEventLog(events: events);
+      final result = payjoin.replayReceiverEventLog(events: parseReceiverEvents(events));
       expect(
         result.state(),
         isA<payjoin.ClosedReceiveSession>(),
@@ -226,7 +226,7 @@ void main() {
       expect(fallbackTx, isNotNull);
       expect(fallbackTx.length, greaterThan(0));
 
-      final result = payjoin.replaySenderEventLog(events: sendPersister.load());
+      final result = payjoin.replaySenderEventLog(events: parseSenderEvents(sendPersister.load()));
       expect(
         result.state(),
         isA<payjoin.ClosedSendSession>(),
@@ -258,7 +258,7 @@ void main() {
       expect(fallbackTx.length, greaterThan(0));
 
       final events = await sendPersister.load();
-      final result = payjoin.replaySenderEventLog(events: events);
+      final result = payjoin.replaySenderEventLog(events: parseSenderEvents(events));
       expect(
         result.state(),
         isA<payjoin.ClosedSendSession>(),
@@ -275,7 +275,7 @@ void main() {
         persister,
       );
       final events = await persister.load();
-      final result = payjoin.replayReceiverEventLog(events: events);
+      final result = payjoin.replayReceiverEventLog(events: parseReceiverEvents(events));
       expect(
         result.state(),
         isA<payjoin.InitializedReceiveSession>(),
@@ -297,7 +297,7 @@ void main() {
       await _buildSenderAsync(psbt, uri, sendPersister, sendBuf);
 
       final events = await sendPersister.load();
-      final senderResult = payjoin.replaySenderEventLog(events: events);
+      final senderResult = payjoin.replaySenderEventLog(events: parseSenderEvents(events));
       expect(
         senderResult.state(),
         isA<payjoin.WithReplyKeySendSession>(),

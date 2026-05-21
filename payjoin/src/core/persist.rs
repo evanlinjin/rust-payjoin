@@ -1,26 +1,41 @@
 //! State machine persistence for payjoin sessions.
 //!
-//! The receiver and senders' v1 and v2 state machines are driven by events. An
-//! event contains all the information to transition into the next state, which
-//! means that the session's full state can be computed by "replaying" the events.
-//! Session history is therefore a recorded as an append only log of events.
+//! The receiver and sender v2 state machines are driven by events. An event
+//! contains all the information to transition into the next state, which
+//! means that the session's full state can be computed by "replaying" the
+//! events. Session history is therefore recorded as an append-only log of
+//! events.
 //!
-//! # Persistence shapes
+//! # The persistence API
 //!
-//! Three coexisting ways to drive persistence are provided:
+//! Sessions are driven through two primitives:
 //!
-//! - [`SessionPersister`] / [`AsyncSessionPersister`] — the original
-//!   callback traits. A transition's `.save(&persister)` invokes the
-//!   storage callback directly.
-//! - `deconstruct()` on each transition — returns a `(PersistActions,
-//!   Outcome)` pair as plain data so callers can drive persistence
-//!   themselves. Crate-internal, used by `.save` / `.save_async`.
-//! - [`EventBuffer`] + [`Provisional`] — a sans-IO event log with
-//!   batched, two-phase persistence (`peek` + `commit`) and runtime
-//!   persist-before-expose gating for side-effect-bearing transitions.
-//!   The buffer is a plain value; the caller's persister (sync or
-//!   async) drains it however it wants, so one typestate path serves
-//!   both worlds without separate trait variants.
+//! - [`EventBuffer<E>`] — a caller-owned, sans-IO event buffer. Action
+//!   methods on receiver / sender typestates push events into it; the
+//!   caller drains it through whatever storage it likes (sync, async,
+//!   batched, transactional). Drain is two-phase: [`EventBuffer::peek`]
+//!   borrows pending events without mutating, then
+//!   [`EventBuffer::commit`] drops the first `n` after storage acks.
+//!   A panic or async cancellation between writes leaves the buffer
+//!   consistent with what's on disk — the un-persisted suffix stays
+//!   queued.
+//!
+//! - [`Provisional<T>`] — a witness type that gates access to a value
+//!   produced by a transition until the producing event has been
+//!   durably persisted in the same buffer. Returned by every transition
+//!   whose result, if observed, would mint an externally-visible side
+//!   effect (e.g. a payjoin URI, an HTTP request to the directory).
+//!   [`Provisional::confirm`] succeeds only when the buffer's
+//!   `committed_count` has reached the recorded sequence number AND the
+//!   buffer's id matches the one the provisional was minted against.
+//!
+//! There is no `SessionPersister`-style trait — that abstraction was
+//! removed in favour of [`EventBuffer`]. The buffer IS the persistence
+//! interface; sync vs async lives in caller code, not in the library's
+//! typestate path. [`InMemoryPersister`] is provided as a concrete
+//! reference implementation for tests and as a starting point for
+//! callers; it exposes inherent `save_event` / `load` / `drain` methods
+//! without going through any trait.
 //!
 //! # Backwards and forwards compatibility
 //!
@@ -185,22 +200,24 @@ impl<T> Provisional<T> {
     /// by [`EventBuffer::push`] on the buffer they pushed into.
     pub(crate) fn new(inner: T, stamp: EventStamp) -> Self { Self { inner, stamp } }
 
-    /// Confirm once the producing event is durable in `buf`. On `Err`,
-    /// returns `self` so the caller can persist more and retry.
-    ///
-    /// Confirm fails (with `Err(self)`) if either:
-    /// - `buf`'s id does not match the buffer this `Provisional` was minted
-    ///   against (wrong-buffer attempt), or
-    /// - `buf.committed_count()` has not yet reached the seq number the
-    ///   producing event was assigned (not-yet-persisted).
-    pub fn confirm<E>(self, buf: &EventBuffer<E>) -> Result<T, Self> {
+    /// Confirm once the producing event is durable in `buf`. On failure,
+    /// returns a [`ConfirmFailure`] that carries the original `Provisional`
+    /// back to the caller along with a kind indicating *why* the confirm
+    /// failed: a `NotYetPersisted` failure is a retry-after-drain signal,
+    /// whereas a `WrongBuffer` failure is a programmer bug (the caller passed
+    /// a freshly-created or unrelated buffer instead of the one this
+    /// `Provisional` was minted against).
+    pub fn confirm<E>(self, buf: &EventBuffer<E>) -> Result<T, ConfirmFailure<T>> {
         if buf.id() != self.stamp.buffer_id {
-            return Err(self);
+            return Err(ConfirmFailure {
+                kind: ConfirmFailureKind::WrongBuffer,
+                provisional: self,
+            });
         }
         if buf.committed_count() >= self.stamp.seq {
             Ok(self.inner)
         } else {
-            Err(self)
+            Err(ConfirmFailure { kind: ConfirmFailureKind::NotYetPersisted, provisional: self })
         }
     }
 
@@ -211,6 +228,33 @@ impl<T> Provisional<T> {
     /// visible side effects from a borrowed inner before [`Self::confirm`]
     /// defeats the persist-before-expose guarantee.
     pub fn peek_inner(&self) -> &T { &self.inner }
+}
+
+/// Failure returned by [`Provisional::confirm`]. The returned `Provisional` is
+/// available for retry, and `kind` discriminates between the two failure
+/// modes so foreign code can distinguish a benign "drain more and retry"
+/// from a programmer bug.
+#[derive(Debug)]
+pub struct ConfirmFailure<T> {
+    /// Why confirm failed.
+    pub kind: ConfirmFailureKind,
+    /// The original [`Provisional`], returned so the caller can retry (for
+    /// `NotYetPersisted`) or recover (for `WrongBuffer`).
+    pub provisional: Provisional<T>,
+}
+
+/// Discriminator for [`ConfirmFailure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmFailureKind {
+    /// The supplied [`EventBuffer`]'s id did not match the buffer this
+    /// `Provisional` was minted against. Retrying with the same buffer will
+    /// never succeed; this is a programmer error (e.g. a freshly-constructed
+    /// buffer was passed by mistake).
+    WrongBuffer,
+    /// The producing event has not yet reached this buffer's
+    /// `committed_count()`. Drain more events through storage and call
+    /// [`Provisional::confirm`] again.
+    NotYetPersisted,
 }
 
 /// Protocol-level error returned by action methods that push events into an
@@ -367,10 +411,13 @@ mod tests {
         let stamp = buf.push("create");
         let provisional = Provisional::new(42_u32, stamp);
 
-        // Before commit: returns self.
+        // Before commit: returns NotYetPersisted with the provisional back.
         let provisional = match provisional.confirm(&buf) {
             Ok(_) => panic!("confirmed before commit"),
-            Err(p) => p,
+            Err(f) => {
+                assert_eq!(f.kind, ConfirmFailureKind::NotYetPersisted);
+                f.provisional
+            }
         };
 
         buf.commit(1);
@@ -391,8 +438,9 @@ mod tests {
         let inner = loop {
             match p.confirm(&buf) {
                 Ok(v) => break v,
-                Err(returned) => {
-                    p = returned;
+                Err(f) => {
+                    assert_eq!(f.kind, ConfirmFailureKind::NotYetPersisted);
+                    p = f.provisional;
                     buf.commit(1);
                 }
             }
@@ -430,7 +478,8 @@ mod tests {
     }
 
     /// Provisional rejects confirm against a freshly created buffer even if
-    /// that buffer's committed_count happens to reach the stamp's seq.
+    /// that buffer's committed_count happens to reach the stamp's seq, and
+    /// surfaces that as `WrongBuffer` (not `NotYetPersisted`).
     #[test]
     fn provisional_confirm_against_fresh_buffer_is_rejected() {
         let mut buf1: EventBuffer<&'static str> = EventBuffer::new();
@@ -439,7 +488,12 @@ mod tests {
         buf1.commit(1);
         // buf1 would confirm, but the user passes buf2 by mistake.
         let buf2: EventBuffer<&'static str> = EventBuffer::new();
-        assert!(provisional.confirm(&buf2).is_err());
+        let failure = provisional.confirm(&buf2).expect_err("wrong buffer should fail");
+        assert_eq!(
+            failure.kind,
+            ConfirmFailureKind::WrongBuffer,
+            "fresh unrelated buffer must surface WrongBuffer, never NotYetPersisted"
+        );
     }
 
     /// Provisional rejects confirm against an unrelated buffer with a
@@ -459,8 +513,10 @@ mod tests {
         buf_b.commit(1);
         assert_eq!(buf_b.committed_count(), 1);
 
-        // Even though the seq counts line up, the buffer ids do not.
-        assert!(provisional.confirm(&buf_b).is_err());
+        // Even though the seq counts line up, the buffer ids do not — and the
+        // failure kind must reflect that (so retrying isn't pointless).
+        let failure = provisional.confirm(&buf_b).expect_err("wrong buffer should fail");
+        assert_eq!(failure.kind, ConfirmFailureKind::WrongBuffer);
     }
 
     /// Demonstrates that an arbitrary drain loop — sync or async — works

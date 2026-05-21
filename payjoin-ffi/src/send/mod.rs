@@ -52,11 +52,13 @@ impl SenderEventBuffer {
     /// Total events durably persisted across the buffer's lifetime.
     pub fn committed_count(&self) -> u64 { self.inner.lock().expect("poisoned").committed_count() }
 
-    /// Borrow pending events as JSON strings. The buffer is not mutated; call
-    /// `commit(n)` after writing the first `n` of these to storage.
-    pub fn peek(&self) -> Result<Vec<String>, SerdeJsonError> {
+    /// Borrow pending events as typed [`SenderSessionEvent`]s. The buffer is
+    /// not mutated; call `commit(n)` after writing the first `n` of these to
+    /// storage. Foreign code typically serializes each event with
+    /// [`SenderSessionEvent::to_json`] at the storage boundary.
+    pub fn peek(&self) -> Vec<Arc<SenderSessionEvent>> {
         let g = self.inner.lock().expect("poisoned");
-        g.peek().map(|e| serde_json::to_string(e).map_err(SerdeJsonError::from)).collect()
+        g.peek().map(|e| Arc::new(SenderSessionEvent::from(e.clone()))).collect()
     }
 
     /// Drop the first `n` events. Call only after storage commits.
@@ -166,26 +168,29 @@ impl SenderReplayResult {
 
     pub fn session_history(&self) -> SenderSessionHistory { self.session_history.clone() }
 
-    /// Number of events that were replayed. Pass this to
-    /// [`SenderEventBuffer::after_replay`] to construct a buffer whose
-    /// committed_count reflects the durable log.
+    /// Number of events that were replayed.
     pub fn event_count(&self) -> u64 { self.event_count }
+
+    /// Construct a fresh [`SenderEventBuffer`] whose `committed_count`
+    /// matches the number of replayed events. Equivalent to
+    /// [`SenderEventBuffer::after_replay`] with [`Self::event_count`], but
+    /// avoids the two-step ceremony at the call site.
+    pub fn into_buffer(&self) -> Arc<SenderEventBuffer> {
+        SenderEventBuffer::after_replay(self.event_count)
+    }
 }
 
 /// Replay the persisted event log into a starting [`SendSession`] and
 /// [`SenderSessionHistory`]. The caller loads its events from storage
-/// however it likes (sync or async, native code) and passes them in as
-/// JSON-encoded strings; the library is sans-IO.
+/// however it likes (sync or async, native code), deserializes each one via
+/// [`SenderSessionEvent::from_json`], and passes them in here; the library is
+/// sans-IO.
 #[uniffi::export]
 pub fn replay_sender_event_log(
-    events: Vec<String>,
+    events: Vec<Arc<SenderSessionEvent>>,
 ) -> Result<SenderReplayResult, SenderReplayError> {
-    let mut parsed = Vec::with_capacity(events.len());
-    for raw in events {
-        let event: payjoin::send::v2::SessionEvent =
-            serde_json::from_str(&raw).map_err(SenderReplayError::storage_serde)?;
-        parsed.push(event);
-    }
+    let parsed: Vec<payjoin::send::v2::SessionEvent> =
+        events.into_iter().map(|e| Arc::unwrap_or_clone(e).into()).collect();
     let event_count = parsed.len() as u64;
     let (state, session_history) = payjoin::send::v2::replay_event_log(parsed)?;
     Ok(SenderReplayResult {
@@ -398,10 +403,9 @@ pub struct ProvisionalWithReplyKey {
 
 #[uniffi::export]
 impl ProvisionalWithReplyKey {
-    /// Confirm against `buf`. Returns the [`WithReplyKey`] sender if the
-    /// producing event is durable in `buf`, otherwise returns
-    /// [`ProvisionalConfirmError::NotYetPersisted`] and leaves the provisional
-    /// reusable for retry.
+    /// Confirm against `buf`. See [`crate::receive::ProvisionalInitialized::confirm`]
+    /// for the shared failure-mode semantics (NotYetPersisted, WrongBuffer,
+    /// AlreadyConsumed).
     pub fn confirm(
         &self,
         buf: &SenderEventBuffer,
@@ -411,9 +415,15 @@ impl ProvisionalWithReplyKey {
         let buf_g = buf.inner.lock().expect("poisoned");
         match p.confirm(&*buf_g) {
             Ok(sender) => Ok(Arc::new(sender.into())),
-            Err(returned) => {
-                *slot = Some(returned);
-                Err(ProvisionalConfirmError::NotYetPersisted)
+            Err(failure) => {
+                let kind = match failure.kind {
+                    payjoin::persist::ConfirmFailureKind::NotYetPersisted =>
+                        ProvisionalConfirmError::NotYetPersisted,
+                    payjoin::persist::ConfirmFailureKind::WrongBuffer =>
+                        ProvisionalConfirmError::WrongBuffer,
+                };
+                *slot = Some(failure.provisional);
+                Err(kind)
             }
         }
     }

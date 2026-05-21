@@ -34,8 +34,8 @@ class InMemoryReceiverPersister extends _InMemoryEventLog {
   /// Drains a `ReceiverEventBuffer` into this in-memory log.
   void drain(payjoin.ReceiverEventBuffer buf) {
     final events = buf.peek();
-    for (final json in events) {
-      save(json);
+    for (final event in events) {
+      save(event.toJson());
     }
     buf.commit(n: BigInt.from(events.length));
   }
@@ -45,8 +45,8 @@ class InMemorySenderPersister extends _InMemoryEventLog {
   /// Drains a `SenderEventBuffer` into this in-memory log.
   void drain(payjoin.SenderEventBuffer buf) {
     final events = buf.peek();
-    for (final json in events) {
-      save(json);
+    for (final event in events) {
+      save(event.toJson());
     }
     buf.commit(n: BigInt.from(events.length));
   }
@@ -56,8 +56,8 @@ class InMemoryReceiverPersisterAsync extends _InMemoryEventLogAsync {
   /// Async-drain a `ReceiverEventBuffer` into this in-memory log.
   Future<void> drain(payjoin.ReceiverEventBuffer buf) async {
     final events = buf.peek();
-    for (final json in events) {
-      await save(json);
+    for (final event in events) {
+      await save(event.toJson());
     }
     buf.commit(n: BigInt.from(events.length));
   }
@@ -67,9 +67,23 @@ class InMemorySenderPersisterAsync extends _InMemoryEventLogAsync {
   /// Async-drain a `SenderEventBuffer` into this in-memory log.
   Future<void> drain(payjoin.SenderEventBuffer buf) async {
     final events = buf.peek();
-    for (final json in events) {
-      await save(json);
+    for (final event in events) {
+      await save(event.toJson());
     }
     buf.commit(n: BigInt.from(events.length));
   }
+}
+
+/// Deserialize a stored JSON log into typed ReceiverSessionEvents.
+List<payjoin.ReceiverSessionEvent> parseReceiverEvents(List<String> jsonEvents) {
+  return jsonEvents
+      .map((s) => payjoin.ReceiverSessionEvent.fromJson(json: s))
+      .toList();
+}
+
+/// Deserialize a stored JSON log into typed SenderSessionEvents.
+List<payjoin.SenderSessionEvent> parseSenderEvents(List<String> jsonEvents) {
+  return jsonEvents
+      .map((s) => payjoin.SenderSessionEvent.fromJson(json: s))
+      .toList();
 }

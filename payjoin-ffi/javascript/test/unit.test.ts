@@ -7,6 +7,8 @@ import {
     InMemoryReceiverPersisterAsync,
     InMemorySenderPersister,
     InMemorySenderPersisterAsync,
+    parseReceiverEvents,
+    parseSenderEvents,
 } from "./utils.ts";
 
 before(async () => {
@@ -141,7 +143,7 @@ describe("Persistence tests", () => {
             persister,
         );
 
-        const result = payjoin.replayReceiverEventLog(persister.load());
+        const result = payjoin.replayReceiverEventLog(parseReceiverEvents(persister.load()));
         const state = result.state();
 
         assert.strictEqual(
@@ -166,7 +168,7 @@ describe("Persistence tests", () => {
 
         assert.ok(withReplyKey, "Sender should be created successfully");
 
-        const result = payjoin.replaySenderEventLog(senderPersister.load());
+        const result = payjoin.replaySenderEventLog(parseSenderEvents(senderPersister.load()));
         assert.strictEqual(result.state().tag, "WithReplyKey");
     });
 });
@@ -184,7 +186,7 @@ describe("Receiver cancel tests", () => {
         persister.drain(buf);
         assert.strictEqual(fallbackTx, undefined);
 
-        const result = payjoin.replayReceiverEventLog(persister.load());
+        const result = payjoin.replayReceiverEventLog(parseReceiverEvents(persister.load()));
         assert.strictEqual(
             result.state().tag,
             "Closed",
@@ -204,7 +206,7 @@ describe("Receiver cancel tests", () => {
         assert.strictEqual(fallbackTx, undefined);
 
         const events = await persister.load();
-        const result = payjoin.replayReceiverEventLog(events);
+        const result = payjoin.replayReceiverEventLog(parseReceiverEvents(events));
         assert.strictEqual(
             result.state().tag,
             "Closed",
@@ -236,7 +238,7 @@ describe("Sender cancel tests", () => {
             "fallback tx bytes should be non-empty",
         );
 
-        const result = payjoin.replaySenderEventLog(senderPersister.load());
+        const result = payjoin.replaySenderEventLog(parseSenderEvents(senderPersister.load()));
         assert.strictEqual(
             result.state().tag,
             "Closed",
@@ -271,7 +273,7 @@ describe("Sender cancel tests", () => {
         );
 
         const events = await senderPersister.load();
-        const result = payjoin.replaySenderEventLog(events);
+        const result = payjoin.replaySenderEventLog(parseSenderEvents(events));
         assert.strictEqual(
             result.state().tag,
             "Closed",
@@ -289,7 +291,7 @@ describe("Async Persistence tests", () => {
         );
 
         const events = await persister.load();
-        const result = payjoin.replayReceiverEventLog(events);
+        const result = payjoin.replayReceiverEventLog(parseReceiverEvents(events));
         const state = result.state();
 
         assert.strictEqual(

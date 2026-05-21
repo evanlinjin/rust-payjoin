@@ -57,18 +57,25 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for ForeignError {
     }
 }
 
-/// Error returned by `ProvisionalInitialized::confirm` and
-/// `ProvisionalWithReplyKey::confirm`. Shared between receiver and sender —
-/// the confirm semantics are identical regardless of which side staged.
+/// Error returned by `ProvisionalInitialized::confirm`,
+/// `ProvisionalWithReplyKey::confirm`, and `ProvisionalPayjoinProposal::confirm`.
+/// Shared between receiver and sender — the confirm semantics are identical
+/// regardless of which side staged.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum ProvisionalConfirmError {
     /// The provisional was already confirmed and consumed.
     #[error("Provisional was already confirmed and consumed")]
     AlreadyConsumed,
-    /// The producing event is not yet durable in the supplied buffer.
-    /// Drain more events and retry, or check that the correct buffer is being
-    /// passed (a freshly-constructed or unrelated buffer is rejected even if
-    /// its committed count is sufficient).
+    /// The producing event is not yet durable in the supplied buffer. Drain
+    /// more events through storage and call `confirm` again — the provisional
+    /// is still reusable.
     #[error("Event not yet persisted in buffer; drain and retry")]
     NotYetPersisted,
+    /// The supplied buffer's id does not match the buffer this provisional
+    /// was minted against. Retrying with the same buffer will never succeed.
+    /// This is a programmer error — typically caused by passing a
+    /// freshly-constructed or unrelated buffer instead of the one used at the
+    /// transition that produced the provisional.
+    #[error("Provisional confirmed against the wrong EventBuffer")]
+    WrongBuffer,
 }

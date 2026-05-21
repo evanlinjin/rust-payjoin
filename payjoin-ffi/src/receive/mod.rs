@@ -65,11 +65,13 @@ impl ReceiverEventBuffer {
     /// Total events durably persisted across the buffer's lifetime.
     pub fn committed_count(&self) -> u64 { self.inner.lock().expect("poisoned").committed_count() }
 
-    /// Borrow pending events as JSON strings. The buffer is not mutated; call
-    /// `commit(n)` after writing the first `n` of these to storage.
-    pub fn peek(&self) -> Result<Vec<String>, SerdeJsonError> {
+    /// Borrow pending events as typed [`ReceiverSessionEvent`]s. The buffer
+    /// is not mutated; call `commit(n)` after writing the first `n` of these
+    /// to storage. Foreign code typically serializes each event with
+    /// [`ReceiverSessionEvent::to_json`] at the storage boundary.
+    pub fn peek(&self) -> Vec<Arc<ReceiverSessionEvent>> {
         let g = self.inner.lock().expect("poisoned");
-        g.peek().map(|e| serde_json::to_string(e).map_err(SerdeJsonError::from)).collect()
+        g.peek().map(|e| Arc::new(ReceiverSessionEvent::from(e.clone()))).collect()
     }
 
     /// Drop the first `n` events. Call only after storage commits.
@@ -85,6 +87,14 @@ impl ReceiverEventBuffer {
 /// The Payjoin URI cannot be observed until the producing event has been
 /// durably persisted in the same [`ReceiverEventBuffer`] this provisional was
 /// minted against. Drain the buffer, then call [`Self::confirm`].
+///
+/// # Lock ordering
+///
+/// `confirm` acquires this provisional's internal mutex and then the
+/// supplied buffer's mutex. Do **not** call `buf.peek()` / `buf.commit()` /
+/// any other action method that touches `buf` from a callback invoked
+/// inside `confirm` — there are no callbacks today, but if foreign code
+/// extends this, that path would deadlock.
 #[derive(uniffi::Object)]
 pub struct ProvisionalInitialized {
     inner: Mutex<
@@ -99,9 +109,16 @@ pub struct ProvisionalInitialized {
 #[uniffi::export]
 impl ProvisionalInitialized {
     /// Confirm against `buf`. Returns the [`Initialized`] receiver if the
-    /// producing event is durable in `buf`, otherwise returns
-    /// [`ProvisionalConfirmError::NotYetPersisted`] and leaves the provisional
-    /// reusable for retry.
+    /// producing event is durable in `buf`, otherwise returns one of:
+    /// - [`ProvisionalConfirmError::NotYetPersisted`] — drain more and retry,
+    /// - [`ProvisionalConfirmError::WrongBuffer`] — programmer error, the
+    ///   wrong buffer was passed,
+    /// - [`ProvisionalConfirmError::AlreadyConsumed`] — confirm was already
+    ///   called successfully and the provisional was consumed.
+    ///
+    /// On `NotYetPersisted` or `WrongBuffer`, the provisional remains in
+    /// the slot so the caller can recover (re-drain for the former, fix the
+    /// buffer reference for the latter).
     pub fn confirm(
         &self,
         buf: &ReceiverEventBuffer,
@@ -111,9 +128,15 @@ impl ProvisionalInitialized {
         let buf_g = buf.inner.lock().expect("poisoned");
         match p.confirm(&*buf_g) {
             Ok(receiver) => Ok(Arc::new(receiver.into())),
-            Err(returned) => {
-                *slot = Some(returned);
-                Err(ProvisionalConfirmError::NotYetPersisted)
+            Err(failure) => {
+                let kind = match failure.kind {
+                    payjoin::persist::ConfirmFailureKind::NotYetPersisted =>
+                        ProvisionalConfirmError::NotYetPersisted,
+                    payjoin::persist::ConfirmFailureKind::WrongBuffer =>
+                        ProvisionalConfirmError::WrongBuffer,
+                };
+                *slot = Some(failure.provisional);
+                Err(kind)
             }
         }
     }
@@ -219,39 +242,48 @@ impl From<payjoin::receive::v2::ReceiveSession> for ReceiveSession {
 // =============================================================================
 
 #[derive(uniffi::Object)]
-pub struct ReplayResult {
+pub struct ReceiverReplayResult {
     state: ReceiveSession,
     session_history: ReceiverSessionHistory,
     event_count: u64,
 }
 
 #[uniffi::export]
-impl ReplayResult {
+impl ReceiverReplayResult {
     pub fn state(&self) -> ReceiveSession { self.state.clone() }
 
     pub fn session_history(&self) -> ReceiverSessionHistory { self.session_history.clone() }
 
-    /// Number of events that were replayed. Pass this to
-    /// [`ReceiverEventBuffer::after_replay`] to construct a buffer whose
-    /// committed_count reflects the durable log.
+    /// Number of events that were replayed.
     pub fn event_count(&self) -> u64 { self.event_count }
+
+    /// Construct a fresh [`ReceiverEventBuffer`] whose `committed_count`
+    /// matches the number of replayed events. Equivalent to
+    /// [`ReceiverEventBuffer::after_replay`] with [`Self::event_count`], but
+    /// avoids the two-step ceremony at the call site.
+    pub fn into_buffer(&self) -> Arc<ReceiverEventBuffer> {
+        ReceiverEventBuffer::after_replay(self.event_count)
+    }
 }
 
 /// Replay the persisted event log into a starting [`ReceiveSession`] and
 /// [`ReceiverSessionHistory`]. The caller loads its events from storage
-/// however it likes (sync or async, native code) and passes them in as
-/// JSON-encoded strings; the library is sans-IO.
+/// however it likes (sync or async, native code), deserializes each one via
+/// [`ReceiverSessionEvent::from_json`], and passes them in here; the library
+/// is sans-IO.
 #[uniffi::export]
-pub fn replay_receiver_event_log(events: Vec<String>) -> Result<ReplayResult, ReceiverReplayError> {
-    let mut parsed = Vec::with_capacity(events.len());
-    for raw in events {
-        let event: payjoin::receive::v2::SessionEvent =
-            serde_json::from_str(&raw).map_err(ReceiverReplayError::storage_serde)?;
-        parsed.push(event);
-    }
+pub fn replay_receiver_event_log(
+    events: Vec<Arc<ReceiverSessionEvent>>,
+) -> Result<ReceiverReplayResult, ReceiverReplayError> {
+    let parsed: Vec<payjoin::receive::v2::SessionEvent> =
+        events.into_iter().map(|e| Arc::unwrap_or_clone(e).into()).collect();
     let event_count = parsed.len() as u64;
     let (state, session_history) = payjoin::receive::v2::replay_event_log(parsed)?;
-    Ok(ReplayResult { state: state.into(), session_history: session_history.into(), event_count })
+    Ok(ReceiverReplayResult {
+        state: state.into(),
+        session_history: session_history.into(),
+        event_count,
+    })
 }
 
 // =============================================================================
@@ -1174,10 +1206,8 @@ pub struct ProvisionalPayjoinProposal {
 
 #[uniffi::export]
 impl ProvisionalPayjoinProposal {
-    /// Confirm against `buf`. Returns the [`PayjoinProposal`] if the producing
-    /// event is durable in `buf`, otherwise returns
-    /// [`ProvisionalConfirmError::NotYetPersisted`] and leaves the provisional
-    /// reusable for retry.
+    /// Confirm against `buf`. See [`ProvisionalInitialized::confirm`] for the
+    /// shared failure-mode semantics.
     pub fn confirm(
         &self,
         buf: &ReceiverEventBuffer,
@@ -1187,9 +1217,15 @@ impl ProvisionalPayjoinProposal {
         let buf_g = buf.inner.lock().expect("poisoned");
         match p.confirm(&*buf_g) {
             Ok(proposal) => Ok(Arc::new(proposal.into())),
-            Err(returned) => {
-                *slot = Some(returned);
-                Err(ProvisionalConfirmError::NotYetPersisted)
+            Err(failure) => {
+                let kind = match failure.kind {
+                    payjoin::persist::ConfirmFailureKind::NotYetPersisted =>
+                        ProvisionalConfirmError::NotYetPersisted,
+                    payjoin::persist::ConfirmFailureKind::WrongBuffer =>
+                        ProvisionalConfirmError::WrongBuffer,
+                };
+                *slot = Some(failure.provisional);
+                Err(kind)
             }
         }
     }

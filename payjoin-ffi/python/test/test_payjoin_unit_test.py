@@ -5,6 +5,8 @@ from .utils import (
     InMemoryReceiverPersisterAsync,
     InMemorySenderPersister,
     InMemorySenderPersisterAsync,
+    parse_receiver_events,
+    parse_sender_events,
 )
 
 
@@ -86,7 +88,7 @@ class TestReceiverPersistence(unittest.TestCase):
         persister = InMemoryReceiverPersister()
         _build_receiver("tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4", persister)
 
-        result = payjoin.replay_receiver_event_log(persister.load())
+        result = payjoin.replay_receiver_event_log(parse_receiver_events(persister.load()))
         self.assertTrue(result.state().is_INITIALIZED())
 
 
@@ -101,7 +103,7 @@ class TestSenderPersistence(unittest.TestCase):
         psbt = payjoin.original_psbt()
         _build_sender(psbt, uri, send_persister, send_buf)
 
-        result = payjoin.replay_sender_event_log(send_persister.load())
+        result = payjoin.replay_sender_event_log(parse_sender_events(send_persister.load()))
         self.assertTrue(result.state().is_WITH_REPLY_KEY())
 
 
@@ -115,7 +117,7 @@ class TestReceiverAsyncPersistence(unittest.TestCase):
                 "tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4", persister
             )
             events = await persister.load()
-            result = payjoin.replay_receiver_event_log(events)
+            result = payjoin.replay_receiver_event_log(parse_receiver_events(events))
             self.assertTrue(result.state().is_INITIALIZED())
 
         asyncio.run(run_test())
@@ -138,7 +140,7 @@ class TestSenderAsyncPersistence(unittest.TestCase):
             await _build_sender_async(psbt, uri, send_persister, send_buf)
 
             events = await send_persister.load()
-            result = payjoin.replay_sender_event_log(events)
+            result = payjoin.replay_sender_event_log(parse_sender_events(events))
             self.assertTrue(result.state().is_WITH_REPLY_KEY())
 
         asyncio.run(run_test())
@@ -156,7 +158,7 @@ class TestReceiverCancel(unittest.TestCase):
         persister.drain(buf)
         self.assertIsNone(fallback_tx)
 
-        result = payjoin.replay_receiver_event_log(persister.load())
+        result = payjoin.replay_receiver_event_log(parse_receiver_events(persister.load()))
         self.assertTrue(result.state().is_CLOSED())
 
 
@@ -175,7 +177,7 @@ class TestReceiverCancelAsync(unittest.TestCase):
             self.assertIsNone(fallback_tx)
 
             events = await persister.load()
-            result = payjoin.replay_receiver_event_log(events)
+            result = payjoin.replay_receiver_event_log(parse_receiver_events(events))
             self.assertTrue(result.state().is_CLOSED())
 
         asyncio.run(run_test())
@@ -200,7 +202,7 @@ class TestSenderCancel(unittest.TestCase):
         self.assertIsNotNone(fallback_tx)
         self.assertTrue(len(fallback_tx) > 0)
 
-        result = payjoin.replay_sender_event_log(send_persister.load())
+        result = payjoin.replay_sender_event_log(parse_sender_events(send_persister.load()))
         self.assertTrue(result.state().is_CLOSED())
 
 
@@ -228,7 +230,7 @@ class TestSenderCancelAsync(unittest.TestCase):
             self.assertTrue(len(fallback_tx) > 0)
 
             events = await send_persister.load()
-            result = payjoin.replay_sender_event_log(events)
+            result = payjoin.replay_sender_event_log(parse_sender_events(events))
             self.assertTrue(result.state().is_CLOSED())
 
         asyncio.run(run_test())

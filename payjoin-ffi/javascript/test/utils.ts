@@ -34,7 +34,7 @@ export class InMemoryReceiverPersister extends MemoryEventLog {
     /** Drains a `ReceiverEventBuffer` into this in-memory log. */
     drain(buf: payjoin.ReceiverEventBuffer): void {
         const events = buf.peek();
-        for (const json of events) this.save(json);
+        for (const event of events) this.save(event.toJson());
         buf.commit(BigInt(events.length));
     }
 }
@@ -43,7 +43,7 @@ export class InMemorySenderPersister extends MemoryEventLog {
     /** Drains a `SenderEventBuffer` into this in-memory log. */
     drain(buf: payjoin.SenderEventBuffer): void {
         const events = buf.peek();
-        for (const json of events) this.save(json);
+        for (const event of events) this.save(event.toJson());
         buf.commit(BigInt(events.length));
     }
 }
@@ -52,7 +52,7 @@ export class InMemoryReceiverPersisterAsync extends MemoryEventLogAsync {
     /** Async-drain a `ReceiverEventBuffer` into this in-memory log. */
     async drain(buf: payjoin.ReceiverEventBuffer): Promise<void> {
         const events = buf.peek();
-        for (const json of events) await this.save(json);
+        for (const event of events) await this.save(event.toJson());
         buf.commit(BigInt(events.length));
     }
 }
@@ -61,7 +61,21 @@ export class InMemorySenderPersisterAsync extends MemoryEventLogAsync {
     /** Async-drain a `SenderEventBuffer` into this in-memory log. */
     async drain(buf: payjoin.SenderEventBuffer): Promise<void> {
         const events = buf.peek();
-        for (const json of events) await this.save(json);
+        for (const event of events) await this.save(event.toJson());
         buf.commit(BigInt(events.length));
     }
+}
+
+/** Deserialize a stored JSON log into typed ReceiverSessionEvents. */
+export function parseReceiverEvents(
+    jsonEvents: string[],
+): payjoin.ReceiverSessionEvent[] {
+    return jsonEvents.map((s) => payjoin.ReceiverSessionEvent.fromJson(s));
+}
+
+/** Deserialize a stored JSON log into typed SenderSessionEvents. */
+export function parseSenderEvents(
+    jsonEvents: string[],
+): payjoin.SenderSessionEvent[] {
+    return jsonEvents.map((s) => payjoin.SenderSessionEvent.fromJson(s));
 }

@@ -159,15 +159,6 @@ pub enum SenderReplayError {
     /// Replay-time error from the library (invalid event sequence, etc.).
     #[error("Replay error: {0}")]
     Replay(String),
-    /// Stored event could not be deserialized as JSON.
-    #[error("Stored event JSON deserialization error: {0}")]
-    StorageSerde(String),
-}
-
-impl SenderReplayError {
-    pub(crate) fn storage_serde(e: serde_json::Error) -> Self {
-        SenderReplayError::StorageSerde(e.to_string())
-    }
 }
 
 impl From<payjoin::error::ReplayError<send::v2::SendSession, send::v2::SessionEvent>>
