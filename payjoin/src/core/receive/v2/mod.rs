@@ -56,7 +56,7 @@ use crate::output_substitution::OutputSubstitution;
 use crate::persist::{
     EventBuffer, MaybeFatalOrSuccessTransition, MaybeFatalTransition,
     MaybeFatalTransitionWithNoResults, MaybeSuccessTransition, MaybeTransientTransition,
-    NextStateTransition, Provisional, TerminalTransition,
+    NextStateTransition, Provisional,
 };
 use crate::receive::{
     check_references, parse_payload, InputOwnedTag, InputPair, InputSeenTag, OriginalPayload,
@@ -347,14 +347,18 @@ impl<State> core::ops::DerefMut for Receiver<State> {
 impl<S: State> Receiver<S> {
     /// Cancel the Payjoin session immediately.
     ///
-    /// Returns a [`TerminalTransition`] that, once persisted, yields the fallback
-    /// transaction when applicable. The fallback transaction is the sender's original
-    /// transaction that should be broadcast to complete the payment without Payjoin.
+    /// Pushes a [`SessionEvent::Closed`] entry into `buf` (the cancellation
+    /// is encoded in the event itself) and returns the sender's fallback
+    /// transaction when applicable, so the caller can broadcast it to
+    /// complete the payment without Payjoin.
     ///
-    /// This is a terminal transition — the session cannot be used after cancellation.
-    pub fn cancel(self) -> TerminalTransition<SessionEvent, Option<bitcoin::Transaction>> {
+    /// This is a terminal action — the session cannot be used after
+    /// cancellation. The caller is expected to drain `buf` through their
+    /// storage and treat the `Closed` event as the session boundary.
+    pub fn cancel(self, buf: &mut EventBuffer<SessionEvent>) -> Option<bitcoin::Transaction> {
         let fallback = self.state.fallback_tx();
-        TerminalTransition::new(SessionEvent::Closed(SessionOutcome::Cancel), fallback)
+        buf.push(SessionEvent::Closed(SessionOutcome::Cancel));
+        fallback
     }
 }
 
@@ -2147,10 +2151,10 @@ pub mod test {
         macro_rules! do_cancel_test {
             ($state:expr, $expected:expr) => {{
                 let persister = InMemoryPersister::<SessionEvent>::default();
+                let mut buf = EventBuffer::new();
                 let fallback = Receiver { state: $state, session_context: SHARED_CONTEXT.clone() }
-                    .cancel()
-                    .save(&persister)
-                    .expect("save should succeed");
+                    .cancel(&mut buf);
+                persister.drain(&mut buf).expect("drain should succeed");
                 assert_eq!(fallback, $expected, "cancel from {}", stringify!($state));
             }};
         }
