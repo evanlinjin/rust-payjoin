@@ -122,18 +122,21 @@ class ProcessPsbtCallback implements payjoin.ProcessPsbt {
   }
 }
 
+/// Build an `Initialized` receiver: stage into the buffer, drain, confirm.
 payjoin.Initialized create_receiver_context(
   String address,
   String directory,
   payjoin.OhttpKeys ohttp_keys,
   InMemoryReceiverPersister persister,
+  payjoin.ReceiverEventBuffer recv_buf,
 ) {
-  var receiver = payjoin.ReceiverBuilder(
+  final provisional = payjoin.ReceiverBuilder(
     address: address,
     directory: directory,
     ohttpKeys: ohttp_keys,
-  ).build().save(persister: persister);
-  return receiver;
+  ).build(buf: recv_buf);
+  persister.drain(recv_buf);
+  return provisional.confirm(buf: recv_buf);
 }
 
 String build_sweep_psbt(payjoin.RpcClient sender, payjoin.PjUri pj_uri) {
@@ -202,90 +205,129 @@ List<payjoin.InputPair> get_inputs(payjoin.RpcClient rpc_connection) {
 Future<payjoin.PayjoinProposalReceiveSession> process_provisional_proposal(
   payjoin.ProvisionalProposal proposal,
   InMemoryReceiverPersister recv_persister,
+  payjoin.ReceiverEventBuffer recv_buf,
 ) async {
-  final payjoin_proposal = proposal
-      .finalizeProposal(processPsbt: ProcessPsbtCallback(receiver))
-      .save(persister: recv_persister);
+  final payjoin_proposal = proposal.finalizeProposal(
+    processPsbt: ProcessPsbtCallback(receiver),
+    buf: recv_buf,
+  );
+  recv_persister.drain(recv_buf);
   return payjoin.PayjoinProposalReceiveSession(payjoin_proposal);
 }
 
 Future<payjoin.PayjoinProposalReceiveSession> process_wants_fee_range(
   payjoin.WantsFeeRange proposal,
   InMemoryReceiverPersister recv_persister,
+  payjoin.ReceiverEventBuffer recv_buf,
 ) async {
-  final wants_fee_range = proposal
-      .applyFeeRange(minFeeRateSatPerVb: 1, maxEffectiveFeeRateSatPerVb: 10)
-      .save(persister: recv_persister);
-  return await process_provisional_proposal(wants_fee_range, recv_persister);
+  final provisional_proposal = proposal.applyFeeRange(
+    minFeeRateSatPerVb: 1,
+    maxEffectiveFeeRateSatPerVb: 10,
+    buf: recv_buf,
+  );
+  recv_persister.drain(recv_buf);
+  return await process_provisional_proposal(
+    provisional_proposal,
+    recv_persister,
+    recv_buf,
+  );
 }
 
 Future<payjoin.PayjoinProposalReceiveSession> process_wants_inputs(
   payjoin.WantsInputs proposal,
   InMemoryReceiverPersister recv_persister,
+  payjoin.ReceiverEventBuffer recv_buf,
 ) async {
-  final provisional_proposal = proposal
+  final wants_fee_range = proposal
       .contributeInputs(replacementInputs: get_inputs(receiver))
-      .commitInputs()
-      .save(persister: recv_persister);
-  return await process_wants_fee_range(provisional_proposal, recv_persister);
+      .commitInputs(buf: recv_buf);
+  recv_persister.drain(recv_buf);
+  return await process_wants_fee_range(
+    wants_fee_range,
+    recv_persister,
+    recv_buf,
+  );
 }
 
 Future<payjoin.PayjoinProposalReceiveSession> process_wants_outputs(
   payjoin.WantsOutputs proposal,
   InMemoryReceiverPersister recv_persister,
+  payjoin.ReceiverEventBuffer recv_buf,
 ) async {
-  final wants_inputs = proposal.commitOutputs().save(persister: recv_persister);
-  return await process_wants_inputs(wants_inputs, recv_persister);
+  final wants_inputs = proposal.commitOutputs(buf: recv_buf);
+  recv_persister.drain(recv_buf);
+  return await process_wants_inputs(wants_inputs, recv_persister, recv_buf);
 }
 
 Future<payjoin.PayjoinProposalReceiveSession> process_outputs_unknown(
   payjoin.OutputsUnknown proposal,
   InMemoryReceiverPersister recv_persister,
+  payjoin.ReceiverEventBuffer recv_buf,
 ) async {
-  final wants_outputs = proposal
-      .identifyReceiverOutputs(
-        isReceiverOutput: IsScriptOwnedCallback(receiver),
-      )
-      .save(persister: recv_persister);
-  return await process_wants_outputs(wants_outputs, recv_persister);
+  final wants_outputs = proposal.identifyReceiverOutputs(
+    isReceiverOutput: IsScriptOwnedCallback(receiver),
+    buf: recv_buf,
+  );
+  recv_persister.drain(recv_buf);
+  return await process_wants_outputs(wants_outputs, recv_persister, recv_buf);
 }
 
 Future<payjoin.PayjoinProposalReceiveSession> process_maybe_inputs_seen(
   payjoin.MaybeInputsSeen proposal,
   InMemoryReceiverPersister recv_persister,
+  payjoin.ReceiverEventBuffer recv_buf,
 ) async {
-  final outputs_unknown = proposal
-      .checkNoInputsSeenBefore(isKnown: CheckInputsNotSeenCallback(receiver))
-      .save(persister: recv_persister);
-  return await process_outputs_unknown(outputs_unknown, recv_persister);
+  final outputs_unknown = proposal.checkNoInputsSeenBefore(
+    isKnown: CheckInputsNotSeenCallback(receiver),
+    buf: recv_buf,
+  );
+  recv_persister.drain(recv_buf);
+  return await process_outputs_unknown(
+    outputs_unknown,
+    recv_persister,
+    recv_buf,
+  );
 }
 
 Future<payjoin.PayjoinProposalReceiveSession> process_maybe_inputs_owned(
   payjoin.MaybeInputsOwned proposal,
   InMemoryReceiverPersister recv_persister,
+  payjoin.ReceiverEventBuffer recv_buf,
 ) async {
-  final maybe_inputs_owned = proposal
-      .checkInputsNotOwned(isOwned: IsScriptOwnedCallback(receiver))
-      .save(persister: recv_persister);
-  return await process_maybe_inputs_seen(maybe_inputs_owned, recv_persister);
+  final maybe_inputs_seen = proposal.checkInputsNotOwned(
+    isOwned: IsScriptOwnedCallback(receiver),
+    buf: recv_buf,
+  );
+  recv_persister.drain(recv_buf);
+  return await process_maybe_inputs_seen(
+    maybe_inputs_seen,
+    recv_persister,
+    recv_buf,
+  );
 }
 
 Future<payjoin.PayjoinProposalReceiveSession> process_unchecked_proposal(
   payjoin.UncheckedOriginalPayload proposal,
   InMemoryReceiverPersister recv_persister,
+  payjoin.ReceiverEventBuffer recv_buf,
 ) async {
-  final unchecked_proposal = proposal
-      .checkBroadcastSuitability(
-        minFeeRateSatPerKwu: null,
-        canBroadcast: MempoolAcceptanceCallback(receiver),
-      )
-      .save(persister: recv_persister);
-  return await process_maybe_inputs_owned(unchecked_proposal, recv_persister);
+  final maybe_inputs_owned = proposal.checkBroadcastSuitability(
+    minFeeRateSatPerKwu: null,
+    canBroadcast: MempoolAcceptanceCallback(receiver),
+    buf: recv_buf,
+  );
+  recv_persister.drain(recv_buf);
+  return await process_maybe_inputs_owned(
+    maybe_inputs_owned,
+    recv_persister,
+    recv_buf,
+  );
 }
 
 Future<payjoin.ReceiveSession?> retrieve_receiver_proposal(
   payjoin.Initialized receiver,
   InMemoryReceiverPersister recv_persister,
+  payjoin.ReceiverEventBuffer recv_buf,
   String ohttp_relay,
 ) async {
   var agent = http.Client();
@@ -295,29 +337,37 @@ Future<payjoin.ReceiveSession?> retrieve_receiver_proposal(
     headers: {"Content-Type": request.request.contentType},
     body: request.request.body,
   );
-  var res = receiver
-      .processResponse(body: response.bodyBytes, ctx: request.clientResponse)
-      .save(persister: recv_persister);
+  var outcome = receiver.processResponse(
+    body: response.bodyBytes,
+    ctx: request.clientResponse,
+    buf: recv_buf,
+  );
+  recv_persister.drain(recv_buf);
 
-  if (res is payjoin.StasisInitializedTransitionOutcome) {
+  if (outcome is payjoin.StasisInitializedTransitionOutcome) {
     return null;
-  } else if (res is payjoin.ProgressInitializedTransitionOutcome) {
-    var proposal = res.inner;
-    return await process_unchecked_proposal(proposal, recv_persister);
+  } else if (outcome is payjoin.ProgressInitializedTransitionOutcome) {
+    return await process_unchecked_proposal(
+      outcome.inner,
+      recv_persister,
+      recv_buf,
+    );
   }
 
-  throw Exception("Unknown initialized transition outcome: $res");
+  throw Exception("Unknown initialized transition outcome: $outcome");
 }
 
 Future<payjoin.ReceiveSession?> process_receiver_proposal(
   payjoin.ReceiveSession receiver,
   InMemoryReceiverPersister recv_persister,
+  payjoin.ReceiverEventBuffer recv_buf,
   String ohttp_relay,
 ) async {
   if (receiver is payjoin.InitializedReceiveSession) {
     var res = await retrieve_receiver_proposal(
       receiver.inner,
       recv_persister,
+      recv_buf,
       ohttp_relay,
     );
     if (res == null) {
@@ -327,25 +377,49 @@ Future<payjoin.ReceiveSession?> process_receiver_proposal(
   }
 
   if (receiver is payjoin.UncheckedOriginalPayloadReceiveSession) {
-    return await process_unchecked_proposal(receiver.inner, recv_persister);
+    return await process_unchecked_proposal(
+      receiver.inner,
+      recv_persister,
+      recv_buf,
+    );
   }
   if (receiver is payjoin.MaybeInputsOwnedReceiveSession) {
-    return await process_maybe_inputs_owned(receiver.inner, recv_persister);
+    return await process_maybe_inputs_owned(
+      receiver.inner,
+      recv_persister,
+      recv_buf,
+    );
   }
   if (receiver is payjoin.MaybeInputsSeenReceiveSession) {
-    return await process_maybe_inputs_seen(receiver.inner, recv_persister);
+    return await process_maybe_inputs_seen(
+      receiver.inner,
+      recv_persister,
+      recv_buf,
+    );
   }
   if (receiver is payjoin.OutputsUnknownReceiveSession) {
-    return await process_outputs_unknown(receiver.inner, recv_persister);
+    return await process_outputs_unknown(
+      receiver.inner,
+      recv_persister,
+      recv_buf,
+    );
   }
   if (receiver is payjoin.WantsOutputsReceiveSession) {
-    return await process_wants_outputs(receiver.inner, recv_persister);
+    return await process_wants_outputs(
+      receiver.inner,
+      recv_persister,
+      recv_buf,
+    );
   }
   if (receiver is payjoin.WantsInputsReceiveSession) {
-    return await process_wants_inputs(receiver.inner, recv_persister);
+    return await process_wants_inputs(receiver.inner, recv_persister, recv_buf);
   }
   if (receiver is payjoin.ProvisionalProposalReceiveSession) {
-    return await process_provisional_proposal(receiver.inner, recv_persister);
+    return await process_provisional_proposal(
+      receiver.inner,
+      recv_persister,
+      recv_buf,
+    );
   }
   if (receiver is payjoin.PayjoinProposalReceiveSession) {
     return receiver;
@@ -448,20 +522,23 @@ void main() {
       final directory = services.directoryUrl();
       final ohttpKeys = services.fetchOhttpKeys();
       final recvPersister = InMemoryReceiverPersister();
-      final pjUri = payjoin.ReceiverBuilder(
+      final recvBuf = payjoin.ReceiverEventBuffer();
+      final provisional = payjoin.ReceiverBuilder(
         address: receiverAddress,
         directory: directory,
         ohttpKeys: ohttpKeys,
-      ).build().save(persister: recvPersister).pjUri();
+      ).build(buf: recvBuf);
+      recvPersister.drain(recvBuf);
+      final pjUri = provisional.confirm(buf: recvBuf).pjUri();
 
       final psbt = test_utils.originalPsbt();
       // Large enough to overflow fee * weight but still parsable as Dart int.
       const overflowFeeRate = 5000000000000; // sat/kwu
       expect(
-        () => payjoin.SenderBuilder(
-          psbt: psbt,
-          uri: pjUri,
-        ).buildRecommended(minFeeRateSatPerKwu: overflowFeeRate),
+        () => payjoin.SenderBuilder(psbt: psbt, uri: pjUri).buildRecommended(
+          minFeeRateSatPerKwu: overflowFeeRate,
+          buf: payjoin.SenderEventBuffer(),
+        ),
         throwsA(isA<payjoin.SenderInputException>()),
       );
 
@@ -490,16 +567,20 @@ void main() {
       // **********************
       // Inside the Receiver:
       var recv_persister = InMemoryReceiverPersister();
+      var recv_buf = payjoin.ReceiverEventBuffer();
       var sender_persister = InMemorySenderPersister();
+      var sender_buf = payjoin.SenderEventBuffer();
       var session = create_receiver_context(
         receiver_address,
         directory,
         ohttp_keys,
         recv_persister,
+        recv_buf,
       );
       var process_response = await process_receiver_proposal(
         payjoin.InitializedReceiveSession(session),
         recv_persister,
+        recv_buf,
         ohttp_relay,
       );
       expect(process_response, isNull);
@@ -510,9 +591,11 @@ void main() {
       var pj_uri = session.pjUri();
       var psbt = build_sweep_psbt(sender, pj_uri);
       payjoin.WithReplyKey req_ctx =
-          payjoin.SenderBuilder(psbt: psbt, uri: pj_uri)
-              .buildRecommended(minFeeRateSatPerKwu: 1000)
-              .save(persister: sender_persister);
+          payjoin.SenderBuilder(psbt: psbt, uri: pj_uri).buildRecommended(
+            minFeeRateSatPerKwu: 1000,
+            buf: sender_buf,
+          );
+      sender_persister.drain(sender_buf);
       payjoin.RequestOhttpContext request = req_ctx.createV2PostRequest(
         ohttpRelay: ohttp_relay,
       );
@@ -521,12 +604,12 @@ void main() {
         headers: {"Content-Type": request.request.contentType},
         body: request.request.body,
       );
-      payjoin.PollingForProposal send_ctx = req_ctx
-          .processResponse(
-            response: response.bodyBytes,
-            postCtx: request.ohttpCtx,
-          )
-          .save(persister: sender_persister);
+      payjoin.PollingForProposal send_ctx = req_ctx.processResponse(
+        response: response.bodyBytes,
+        postCtx: request.ohttpCtx,
+        buf: sender_buf,
+      );
+      sender_persister.drain(sender_buf);
       // POST Original PSBT
 
       // **********************
@@ -537,6 +620,7 @@ void main() {
           await process_receiver_proposal(
             payjoin.InitializedReceiveSession(session),
             recv_persister,
+            recv_buf,
             ohttp_relay,
           );
       expect(payjoin_proposal, isNotNull);
@@ -555,7 +639,9 @@ void main() {
       proposal.processResponse(
         body: fallback_response.bodyBytes,
         ohttpContext: request_response.clientResponse,
+        buf: recv_buf,
       );
+      recv_persister.drain(recv_buf);
 
       // **********************
       // Inside the Sender:
@@ -571,12 +657,12 @@ void main() {
           headers: {"Content-Type": ohttp_context_request.request.contentType},
           body: ohttp_context_request.request.body,
         );
-        poll_outcome = send_ctx
-            .processResponse(
-              response: final_response.bodyBytes,
-              ohttpCtx: ohttp_context_request.ohttpCtx,
-            )
-            .save(persister: sender_persister);
+        poll_outcome = send_ctx.processResponse(
+          response: final_response.bodyBytes,
+          ohttpCtx: ohttp_context_request.ohttpCtx,
+          buf: sender_buf,
+        );
+        sender_persister.drain(sender_buf);
 
         if (poll_outcome
             is payjoin.ProgressPollingForProposalTransitionOutcome) {

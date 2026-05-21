@@ -1,5 +1,11 @@
 import { payjoin } from "payjoin";
 
+// Drain helpers used by the test suite. After the FFI lost SessionPersister,
+// persistence is driven directly: each action method pushes events into an
+// EventBuffer, and the caller writes those events to storage in any way it
+// likes. These helpers wrap that pattern: `drain(buf)` peeks the queued
+// events, appends them to an in-memory list, then commits.
+
 class MemoryEventLog {
     readonly events: string[] = [];
     closed = false;
@@ -9,7 +15,7 @@ class MemoryEventLog {
     }
 
     load(): string[] {
-        return this.events;
+        return [...this.events];
     }
 
     close(): void {
@@ -26,7 +32,7 @@ class MemoryEventLogAsync {
     }
 
     async load(): Promise<string[]> {
-        return this.events;
+        return [...this.events];
     }
 
     async close(): Promise<void> {
@@ -34,18 +40,38 @@ class MemoryEventLogAsync {
     }
 }
 
-export class InMemoryReceiverPersister
-    extends MemoryEventLog
-    implements payjoin.JsonReceiverSessionPersister {}
+export class InMemoryReceiverPersister extends MemoryEventLog {
+    /** Drains a `ReceiverEventBuffer` into this in-memory log. */
+    drain(buf: payjoin.ReceiverEventBuffer): void {
+        const events = buf.peek();
+        for (const json of events) this.save(json);
+        buf.commit(BigInt(events.length));
+    }
+}
 
-export class InMemorySenderPersister
-    extends MemoryEventLog
-    implements payjoin.JsonSenderSessionPersister {}
+export class InMemorySenderPersister extends MemoryEventLog {
+    /** Drains a `SenderEventBuffer` into this in-memory log. */
+    drain(buf: payjoin.SenderEventBuffer): void {
+        const events = buf.peek();
+        for (const json of events) this.save(json);
+        buf.commit(BigInt(events.length));
+    }
+}
 
-export class InMemoryReceiverPersisterAsync
-    extends MemoryEventLogAsync
-    implements payjoin.JsonReceiverSessionPersisterAsync {}
+export class InMemoryReceiverPersisterAsync extends MemoryEventLogAsync {
+    /** Async-drain a `ReceiverEventBuffer` into this in-memory log. */
+    async drain(buf: payjoin.ReceiverEventBuffer): Promise<void> {
+        const events = buf.peek();
+        for (const json of events) await this.save(json);
+        buf.commit(BigInt(events.length));
+    }
+}
 
-export class InMemorySenderPersisterAsync
-    extends MemoryEventLogAsync
-    implements payjoin.JsonSenderSessionPersisterAsync {}
+export class InMemorySenderPersisterAsync extends MemoryEventLogAsync {
+    /** Async-drain a `SenderEventBuffer` into this in-memory log. */
+    async drain(buf: payjoin.SenderEventBuffer): Promise<void> {
+        const events = buf.peek();
+        for (const json of events) await this.save(json);
+        buf.commit(BigInt(events.length));
+    }
+}

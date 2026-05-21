@@ -8,6 +8,36 @@ from .utils import (
 )
 
 
+OHTTP_KEYS_HEX = (
+    "01001604ba48c49c3d4a92a3ad00ecc63a024da10ced02180c73ec12d8a7ad2cc91bb4"
+    "83824fe2bee8d28bfe2eb2fc6453bc4d31cd851e8a6540e86c5382af588d3709570004"
+    "00010003"
+)
+
+
+def _ohttp_keys():
+    return payjoin.OhttpKeys.decode(bytes.fromhex(OHTTP_KEYS_HEX))
+
+
+def _build_receiver(address, persister):
+    """Build an `Initialized` receiver: stage into a buffer, drain, confirm."""
+    buf = payjoin.ReceiverEventBuffer()
+    provisional = payjoin.ReceiverBuilder(
+        address, "https://example.com", _ohttp_keys()
+    ).build(buf)
+    persister.drain(buf)
+    return provisional.confirm(buf), buf
+
+
+async def _build_receiver_async(address, persister):
+    buf = payjoin.ReceiverEventBuffer()
+    provisional = payjoin.ReceiverBuilder(
+        address, "https://example.com", _ohttp_keys()
+    ).build(buf)
+    await persister.drain(buf)
+    return provisional.confirm(buf), buf
+
+
 class TestURIs(unittest.TestCase):
     def test_todo_url_encoded(self):
         uri = "bitcoin:12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX?amount=1&pj=https://example.com?ciao"
@@ -41,43 +71,26 @@ class TestURIs(unittest.TestCase):
 class TestReceiverPersistence(unittest.TestCase):
     def test_receiver_persistence(self):
         persister = InMemoryReceiverPersister()
-        payjoin.ReceiverBuilder(
-            "tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4",
-            "https://example.com",
-            payjoin.OhttpKeys.decode(
-                bytes.fromhex(
-                    "01001604ba48c49c3d4a92a3ad00ecc63a024da10ced02180c73ec12d8a7ad2cc91bb483824fe2bee8d28bfe2eb2fc6453bc4d31cd851e8a6540e86c5382af588d370957000400010003"
-                )
-            ),
-        ).build().save(persister)
-        result = payjoin.replay_receiver_event_log(persister)
+        _build_receiver("tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4", persister)
+
+        result = payjoin.replay_receiver_event_log(persister.load())
         self.assertTrue(result.state().is_INITIALIZED())
 
 
 class TestSenderPersistence(unittest.TestCase):
     def test_sender_persistence(self):
-        # Create a receiver to just get the pj uri
-        persister = InMemoryReceiverPersister()
-        receiver = (
-            payjoin.ReceiverBuilder(
-                "2MuyMrZHkbHbfjudmKUy45dU4P17pjG2szK",
-                "https://example.com",
-                payjoin.OhttpKeys.decode(
-                    bytes.fromhex(
-                        "01001604ba48c49c3d4a92a3ad00ecc63a024da10ced02180c73ec12d8a7ad2cc91bb483824fe2bee8d28bfe2eb2fc6453bc4d31cd851e8a6540e86c5382af588d370957000400010003"
-                    )
-                ),
-            )
-            .build()
-            .save(persister)
-        )
+        recv_persister = InMemoryReceiverPersister()
+        receiver, _ = _build_receiver("2MuyMrZHkbHbfjudmKUy45dU4P17pjG2szK", recv_persister)
         uri = receiver.pj_uri()
 
-        persister = InMemorySenderPersister()
+        send_persister = InMemorySenderPersister()
+        send_buf = payjoin.SenderEventBuffer()
         psbt = payjoin.original_psbt()
-        with_reply_key = (
-            payjoin.SenderBuilder(psbt, uri).build_recommended(1000).save(persister)
-        )
+        payjoin.SenderBuilder(psbt, uri).build_recommended(1000, send_buf)
+        send_persister.drain(send_buf)
+
+        result = payjoin.replay_sender_event_log(send_persister.load())
+        self.assertTrue(result.state().is_WITH_REPLY_KEY())
 
 
 class TestReceiverAsyncPersistence(unittest.TestCase):
@@ -86,20 +99,11 @@ class TestReceiverAsyncPersistence(unittest.TestCase):
 
         async def run_test():
             persister = InMemoryReceiverPersisterAsync()
-            await (
-                payjoin.ReceiverBuilder(
-                    "tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4",
-                    "https://example.com",
-                    payjoin.OhttpKeys.decode(
-                        bytes.fromhex(
-                            "01001604ba48c49c3d4a92a3ad00ecc63a024da10ced02180c73ec12d8a7ad2cc91bb483824fe2bee8d28bfe2eb2fc6453bc4d31cd851e8a6540e86c5382af588d370957000400010003"
-                        )
-                    ),
-                )
-                .build()
-                .save_async(persister)
+            await _build_receiver_async(
+                "tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4", persister
             )
-            result = await payjoin.replay_receiver_event_log_async(persister)
+            events = await persister.load()
+            result = payjoin.replay_receiver_event_log(events)
             self.assertTrue(result.state().is_INITIALIZED())
 
         asyncio.run(run_test())
@@ -110,30 +114,21 @@ class TestSenderAsyncPersistence(unittest.TestCase):
         import asyncio
 
         async def run_test():
-            # Create a receiver to just get the pj uri
-            persister = InMemoryReceiverPersisterAsync()
-            receiver = await (
-                payjoin.ReceiverBuilder(
-                    "2MuyMrZHkbHbfjudmKUy45dU4P17pjG2szK",
-                    "https://example.com",
-                    payjoin.OhttpKeys.decode(
-                        bytes.fromhex(
-                            "01001604ba48c49c3d4a92a3ad00ecc63a024da10ced02180c73ec12d8a7ad2cc91bb483824fe2bee8d28bfe2eb2fc6453bc4d31cd851e8a6540e86c5382af588d370957000400010003"
-                        )
-                    ),
-                )
-                .build()
-                .save_async(persister)
+            recv_persister = InMemoryReceiverPersisterAsync()
+            receiver, _ = await _build_receiver_async(
+                "2MuyMrZHkbHbfjudmKUy45dU4P17pjG2szK", recv_persister
             )
             uri = receiver.pj_uri()
 
-            persister = InMemorySenderPersisterAsync()
+            send_persister = InMemorySenderPersisterAsync()
+            send_buf = payjoin.SenderEventBuffer()
             psbt = payjoin.original_psbt()
-            with_reply_key = await (
-                payjoin.SenderBuilder(psbt, uri)
-                .build_recommended(1000)
-                .save_async(persister)
-            )
+            payjoin.SenderBuilder(psbt, uri).build_recommended(1000, send_buf)
+            await send_persister.drain(send_buf)
+
+            events = await send_persister.load()
+            result = payjoin.replay_sender_event_log(events)
+            self.assertTrue(result.state().is_WITH_REPLY_KEY())
 
         asyncio.run(run_test())
 
@@ -141,23 +136,16 @@ class TestSenderAsyncPersistence(unittest.TestCase):
 class TestReceiverCancel(unittest.TestCase):
     def test_receiver_cancel(self):
         persister = InMemoryReceiverPersister()
-        initialized = (
-            payjoin.ReceiverBuilder(
-                "tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4",
-                "https://example.com",
-                payjoin.OhttpKeys.decode(
-                    bytes.fromhex(
-                        "01001604ba48c49c3d4a92a3ad00ecc63a024da10ced02180c73ec12d8a7ad2cc91bb483824fe2bee8d28bfe2eb2fc6453bc4d31cd851e8a6540e86c5382af588d370957000400010003"
-                    )
-                ),
-            )
-            .build()
-            .save(persister)
+        initialized, buf = _build_receiver(
+            "tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4", persister
         )
-        cancel_transition = initialized.cancel()
-        fallback_tx = cancel_transition.save(persister)
+
+        # cancel pushes a Closed event; no fallback for early-state receiver.
+        fallback_tx = initialized.cancel(buf)
+        persister.drain(buf)
         self.assertIsNone(fallback_tx)
-        result = payjoin.replay_receiver_event_log(persister)
+
+        result = payjoin.replay_receiver_event_log(persister.load())
         self.assertTrue(result.state().is_CLOSED())
 
 
@@ -167,23 +155,16 @@ class TestReceiverCancelAsync(unittest.TestCase):
 
         async def run_test():
             persister = InMemoryReceiverPersisterAsync()
-            initialized = await (
-                payjoin.ReceiverBuilder(
-                    "tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4",
-                    "https://example.com",
-                    payjoin.OhttpKeys.decode(
-                        bytes.fromhex(
-                            "01001604ba48c49c3d4a92a3ad00ecc63a024da10ced02180c73ec12d8a7ad2cc91bb483824fe2bee8d28bfe2eb2fc6453bc4d31cd851e8a6540e86c5382af588d370957000400010003"
-                        )
-                    ),
-                )
-                .build()
-                .save_async(persister)
+            initialized, buf = await _build_receiver_async(
+                "tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4", persister
             )
-            cancel_transition = initialized.cancel()
-            fallback_tx = await cancel_transition.save_async(persister)
+
+            fallback_tx = initialized.cancel(buf)
+            await persister.drain(buf)
             self.assertIsNone(fallback_tx)
-            result = await payjoin.replay_receiver_event_log_async(persister)
+
+            events = await persister.load()
+            result = payjoin.replay_receiver_event_log(events)
             self.assertTrue(result.state().is_CLOSED())
 
         asyncio.run(run_test())
@@ -191,33 +172,27 @@ class TestReceiverCancelAsync(unittest.TestCase):
 
 class TestSenderCancel(unittest.TestCase):
     def test_sender_cancel(self):
-        # Create a receiver to just get the pj uri
-        persister = InMemoryReceiverPersister()
-        receiver = (
-            payjoin.ReceiverBuilder(
-                "2MuyMrZHkbHbfjudmKUy45dU4P17pjG2szK",
-                "https://example.com",
-                payjoin.OhttpKeys.decode(
-                    bytes.fromhex(
-                        "01001604ba48c49c3d4a92a3ad00ecc63a024da10ced02180c73ec12d8a7ad2cc91bb483824fe2bee8d28bfe2eb2fc6453bc4d31cd851e8a6540e86c5382af588d370957000400010003"
-                    )
-                ),
-            )
-            .build()
-            .save(persister)
+        recv_persister = InMemoryReceiverPersister()
+        receiver, _ = _build_receiver(
+            "2MuyMrZHkbHbfjudmKUy45dU4P17pjG2szK", recv_persister
         )
         uri = receiver.pj_uri()
 
-        persister = InMemorySenderPersister()
+        send_persister = InMemorySenderPersister()
+        send_buf = payjoin.SenderEventBuffer()
         psbt = payjoin.original_psbt()
-        with_reply_key = (
-            payjoin.SenderBuilder(psbt, uri).build_recommended(1000).save(persister)
+        with_reply_key = payjoin.SenderBuilder(psbt, uri).build_recommended(
+            1000, send_buf
         )
-        cancel_transition = with_reply_key.cancel()
-        fallback_tx = cancel_transition.save(persister)
+        send_persister.drain(send_buf)
+
+        # Sender cancel always returns a fallback transaction (raw bytes).
+        fallback_tx = with_reply_key.cancel(send_buf)
+        send_persister.drain(send_buf)
         self.assertIsNotNone(fallback_tx)
         self.assertTrue(len(fallback_tx) > 0)
-        result = payjoin.replay_sender_event_log(persister)
+
+        result = payjoin.replay_sender_event_log(send_persister.load())
         self.assertTrue(result.state().is_CLOSED())
 
 
@@ -226,35 +201,27 @@ class TestSenderCancelAsync(unittest.TestCase):
         import asyncio
 
         async def run_test():
-            # Create a receiver to just get the pj uri
-            persister = InMemoryReceiverPersisterAsync()
-            receiver = await (
-                payjoin.ReceiverBuilder(
-                    "2MuyMrZHkbHbfjudmKUy45dU4P17pjG2szK",
-                    "https://example.com",
-                    payjoin.OhttpKeys.decode(
-                        bytes.fromhex(
-                            "01001604ba48c49c3d4a92a3ad00ecc63a024da10ced02180c73ec12d8a7ad2cc91bb483824fe2bee8d28bfe2eb2fc6453bc4d31cd851e8a6540e86c5382af588d370957000400010003"
-                        )
-                    ),
-                )
-                .build()
-                .save_async(persister)
+            recv_persister = InMemoryReceiverPersisterAsync()
+            receiver, _ = await _build_receiver_async(
+                "2MuyMrZHkbHbfjudmKUy45dU4P17pjG2szK", recv_persister
             )
             uri = receiver.pj_uri()
 
-            persister = InMemorySenderPersisterAsync()
+            send_persister = InMemorySenderPersisterAsync()
+            send_buf = payjoin.SenderEventBuffer()
             psbt = payjoin.original_psbt()
-            with_reply_key = await (
-                payjoin.SenderBuilder(psbt, uri)
-                .build_recommended(1000)
-                .save_async(persister)
+            with_reply_key = payjoin.SenderBuilder(psbt, uri).build_recommended(
+                1000, send_buf
             )
-            cancel_transition = with_reply_key.cancel()
-            fallback_tx = await cancel_transition.save_async(persister)
+            await send_persister.drain(send_buf)
+
+            fallback_tx = with_reply_key.cancel(send_buf)
+            await send_persister.drain(send_buf)
             self.assertIsNotNone(fallback_tx)
             self.assertTrue(len(fallback_tx) > 0)
-            result = await payjoin.replay_sender_event_log_async(persister)
+
+            events = await send_persister.load()
+            result = payjoin.replay_sender_event_log(events)
             self.assertTrue(result.state().is_CLOSED())
 
         asyncio.run(run_test())
@@ -263,15 +230,7 @@ class TestSenderCancelAsync(unittest.TestCase):
 class TestValidation(unittest.TestCase):
     def test_receiver_builder_rejects_bad_address(self):
         with self.assertRaises(payjoin.ReceiverBuilderError):
-            payjoin.ReceiverBuilder(
-                "not-an-address",
-                "https://example.com",
-                payjoin.OhttpKeys.decode(
-                    bytes.fromhex(
-                        "01001604ba48c49c3d4a92a3ad00ecc63a024da10ced02180c73ec12d8a7ad2cc91bb483824fe2bee8d28bfe2eb2fc6453bc4d31cd851e8a6540e86c5382af588d370957000400010003"
-                    )
-                ),
-            )
+            payjoin.ReceiverBuilder("not-an-address", "https://example.com", _ohttp_keys())
 
     def test_input_pair_rejects_invalid_outpoint(self):
         with self.assertRaises(payjoin.InputPairError):

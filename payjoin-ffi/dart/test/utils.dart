@@ -1,6 +1,12 @@
 import "package:payjoin/payjoin.dart" as payjoin;
 
-class _InMemoryPersister {
+// Drain helpers used by the test suite. After the FFI lost SessionPersister,
+// persistence is driven directly: each action method pushes events into an
+// EventBuffer, and the caller writes those events to storage in any way it
+// likes. These helpers wrap that pattern: `drain(buf)` peeks the queued
+// events, appends them to an in-memory list, then commits.
+
+class _InMemoryEventLog {
   final List<String> events = [];
   bool closed = false;
 
@@ -9,7 +15,7 @@ class _InMemoryPersister {
   }
 
   List<String> load() {
-    return events;
+    return List.of(events);
   }
 
   void close() {
@@ -17,7 +23,7 @@ class _InMemoryPersister {
   }
 }
 
-class _InMemoryPersisterAsync {
+class _InMemoryEventLogAsync {
   final List<String> events = [];
   bool closed = false;
 
@@ -26,7 +32,7 @@ class _InMemoryPersisterAsync {
   }
 
   Future<List<String>> load() async {
-    return events;
+    return List.of(events);
   }
 
   Future<void> close() async {
@@ -34,14 +40,46 @@ class _InMemoryPersisterAsync {
   }
 }
 
-class InMemoryReceiverPersister extends _InMemoryPersister
-    implements payjoin.JsonReceiverSessionPersister {}
+class InMemoryReceiverPersister extends _InMemoryEventLog {
+  /// Drains a `ReceiverEventBuffer` into this in-memory log.
+  void drain(payjoin.ReceiverEventBuffer buf) {
+    final events = buf.peek();
+    for (final json in events) {
+      save(json);
+    }
+    buf.commit(n: BigInt.from(events.length));
+  }
+}
 
-class InMemorySenderPersister extends _InMemoryPersister
-    implements payjoin.JsonSenderSessionPersister {}
+class InMemorySenderPersister extends _InMemoryEventLog {
+  /// Drains a `SenderEventBuffer` into this in-memory log.
+  void drain(payjoin.SenderEventBuffer buf) {
+    final events = buf.peek();
+    for (final json in events) {
+      save(json);
+    }
+    buf.commit(n: BigInt.from(events.length));
+  }
+}
 
-class InMemoryReceiverPersisterAsync extends _InMemoryPersisterAsync
-    implements payjoin.JsonReceiverSessionPersisterAsync {}
+class InMemoryReceiverPersisterAsync extends _InMemoryEventLogAsync {
+  /// Async-drain a `ReceiverEventBuffer` into this in-memory log.
+  Future<void> drain(payjoin.ReceiverEventBuffer buf) async {
+    final events = buf.peek();
+    for (final json in events) {
+      await save(json);
+    }
+    buf.commit(n: BigInt.from(events.length));
+  }
+}
 
-class InMemorySenderPersisterAsync extends _InMemoryPersisterAsync
-    implements payjoin.JsonSenderSessionPersisterAsync {}
+class InMemorySenderPersisterAsync extends _InMemoryEventLogAsync {
+  /// Async-drain a `SenderEventBuffer` into this in-memory log.
+  Future<void> drain(payjoin.SenderEventBuffer buf) async {
+    final events = buf.peek();
+    for (final json in events) {
+      await save(json);
+    }
+    buf.commit(n: BigInt.from(events.length));
+  }
+}

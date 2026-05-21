@@ -1,53 +1,77 @@
-import payjoin
+"""In-memory drain helpers used by the test suite.
+
+After the FFI lost SessionPersister, persistence is driven directly: each action
+method pushes events into an EventBuffer, and the caller writes those events to
+storage in any way it likes. These helpers wrap that pattern: `drain(buf)` peeks
+the queued events, appends them to an in-memory list, then commits.
+"""
 
 
-class _InMemoryPersister:
+class _InMemoryEventLog:
     def __init__(self):
         self.events = []
         self.closed = False
 
-    def save(self, event: str):
-        self.events.append(event)
+    def save(self, json_event: str):
+        self.events.append(json_event)
 
     def load(self):
-        return self.events
+        return list(self.events)
 
     def close(self):
         self.closed = True
 
 
-class _InMemoryPersisterAsync:
+class InMemoryReceiverPersister(_InMemoryEventLog):
+    """Drains a `ReceiverEventBuffer` into an in-memory event log."""
+
+    def drain(self, buf):
+        events = buf.peek()
+        for json_event in events:
+            self.save(json_event)
+        buf.commit(len(events))
+
+
+class InMemorySenderPersister(_InMemoryEventLog):
+    """Drains a `SenderEventBuffer` into an in-memory event log."""
+
+    def drain(self, buf):
+        events = buf.peek()
+        for json_event in events:
+            self.save(json_event)
+        buf.commit(len(events))
+
+
+class _InMemoryEventLogAsync:
     def __init__(self):
         self.events = []
         self.closed = False
 
-    async def save(self, event: str):
-        self.events.append(event)
+    async def save(self, json_event: str):
+        self.events.append(json_event)
 
     async def load(self):
-        return self.events
+        return list(self.events)
 
     async def close(self):
         self.closed = True
 
 
-class InMemoryReceiverPersister(
-    _InMemoryPersister, payjoin.JsonReceiverSessionPersister
-):
-    pass
+class InMemoryReceiverPersisterAsync(_InMemoryEventLogAsync):
+    """Async-drain a `ReceiverEventBuffer` into an in-memory log."""
+
+    async def drain(self, buf):
+        events = buf.peek()
+        for json_event in events:
+            await self.save(json_event)
+        buf.commit(len(events))
 
 
-class InMemorySenderPersister(_InMemoryPersister, payjoin.JsonSenderSessionPersister):
-    pass
+class InMemorySenderPersisterAsync(_InMemoryEventLogAsync):
+    """Async-drain a `SenderEventBuffer` into an in-memory log."""
 
-
-class InMemoryReceiverPersisterAsync(
-    _InMemoryPersisterAsync, payjoin.JsonReceiverSessionPersisterAsync
-):
-    pass
-
-
-class InMemorySenderPersisterAsync(
-    _InMemoryPersisterAsync, payjoin.JsonSenderSessionPersisterAsync
-):
-    pass
+    async def drain(self, buf):
+        events = buf.peek()
+        for json_event in events:
+            await self.save(json_event)
+        buf.commit(len(events))
