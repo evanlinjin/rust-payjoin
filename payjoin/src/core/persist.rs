@@ -18,8 +18,9 @@
 //! - [`EventBuffer`] + [`Provisional`] — a sans-IO event log with
 //!   batched, two-phase persistence (`peek` + `commit`) and runtime
 //!   persist-before-expose gating for side-effect-bearing transitions.
-//!   Suitable for callers that want uniform sync/async support without
-//!   two trait variants.
+//!   The buffer is a plain value; the caller's persister (sync or
+//!   async) drains it however it wants, so one typestate path serves
+//!   both worlds without separate trait variants.
 //!
 //! # Backwards and forwards compatibility
 //!
@@ -162,88 +163,6 @@ impl<T> Provisional<T> {
     /// visible side effects from a borrowed inner before [`Self::confirm`]
     /// defeats the persist-before-expose guarantee.
     pub fn peek_inner(&self) -> &T { &self.inner }
-}
-
-/// Persist all events queued in `buf` via the given [`SessionPersister`].
-///
-/// Drains events one at a time, committing each in the buffer immediately
-/// after its write succeeds. A panic between writes leaves the un-persisted
-/// suffix queued; storage and buffer remain consistent.
-///
-/// Requires `Event: Clone` so each event can be moved into
-/// [`SessionPersister::save_event`] while remaining in the buffer until the
-/// write returns successfully.
-pub fn save_buffer<P>(
-    persister: &P,
-    buf: &mut EventBuffer<P::SessionEvent>,
-) -> Result<(), P::InternalStorageError>
-where
-    P: SessionPersister,
-    P::SessionEvent: Clone,
-{
-    loop {
-        let Some(event) = buf.peek().next().cloned() else {
-            return Ok(());
-        };
-        persister.save_event(event)?;
-        buf.commit(1);
-    }
-}
-
-/// Persist all queued events, then unlock and return the [`Provisional`]'s
-/// inner value.
-///
-/// After [`save_buffer`] succeeds the gate event is durable, so `confirm` is
-/// structurally unreachable on the error path.
-pub fn save_buffer_and_confirm<P, T>(
-    persister: &P,
-    buf: &mut EventBuffer<P::SessionEvent>,
-    provisional: Provisional<T>,
-) -> Result<T, P::InternalStorageError>
-where
-    P: SessionPersister,
-    P::SessionEvent: Clone,
-{
-    save_buffer(persister, buf)?;
-    Ok(provisional
-        .confirm(buf)
-        .unwrap_or_else(|_| unreachable!("save_buffer committed all events")))
-}
-
-/// Async counterpart to [`save_buffer`], for use with
-/// [`AsyncSessionPersister`].
-pub async fn save_buffer_async<P>(
-    persister: &P,
-    buf: &mut EventBuffer<P::SessionEvent>,
-) -> Result<(), P::InternalStorageError>
-where
-    P: AsyncSessionPersister,
-    P::SessionEvent: Clone,
-{
-    loop {
-        let Some(event) = buf.peek().next().cloned() else {
-            return Ok(());
-        };
-        persister.save_event(event).await?;
-        buf.commit(1);
-    }
-}
-
-/// Async counterpart to [`save_buffer_and_confirm`], for use with
-/// [`AsyncSessionPersister`].
-pub async fn save_buffer_and_confirm_async<P, T>(
-    persister: &P,
-    buf: &mut EventBuffer<P::SessionEvent>,
-    provisional: Provisional<T>,
-) -> Result<T, P::InternalStorageError>
-where
-    P: AsyncSessionPersister,
-    P::SessionEvent: Clone,
-{
-    save_buffer_async(persister, buf).await?;
-    Ok(provisional
-        .confirm(buf)
-        .unwrap_or_else(|_| unreachable!("save_buffer_async committed all events")))
 }
 
 /// Representation of the actions that the persister should take, if any.
@@ -1783,48 +1702,44 @@ mod tests {
         assert_eq!(p.peek_inner(), "hidden");
     }
 
+    /// Demonstrates that an arbitrary drain loop — sync or async — works
+    /// on the same buffer value. The library ships no trait-bound bridge:
+    /// `EventBuffer` is the unified API, callers own the drain.
     #[tokio::test]
-    async fn save_buffer_drains_into_session_persister() {
-        let persister: InMemoryPersister<InMemoryTestEvent> = InMemoryPersister::default();
-        let mut buf: EventBuffer<InMemoryTestEvent> = EventBuffer::new();
-        let seq_a = buf.push(InMemoryTestEvent("a".to_string()));
-        let seq_b = buf.push(InMemoryTestEvent("b".to_string()));
-        assert_eq!(seq_a, 1);
-        assert_eq!(seq_b, 2);
+    async fn caller_owned_drain_loops_share_one_buffer_shape() {
+        // Sync drain into a Vec<E>: peek the front event, write it (here,
+        // append to a Vec), commit one. No SessionPersister involvement.
+        let mut buf: EventBuffer<String> = EventBuffer::new();
+        buf.push("a".to_string());
+        let seq = buf.push("b".to_string());
+        let provisional = Provisional::new("uri".to_string(), seq);
 
-        save_buffer(&persister, &mut buf).expect("save_buffer succeeds");
+        let mut storage: Vec<String> = Vec::new();
+        loop {
+            let Some(event) = buf.peek().next().cloned() else { break };
+            storage.push(event);
+            buf.commit(1);
+        }
+        assert_eq!(storage, vec!["a".to_string(), "b".to_string()]);
         assert!(buf.is_empty());
         assert_eq!(buf.committed_count(), 2);
-
-        let events: Vec<InMemoryTestEvent> = persister.load().expect("load").collect();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].0, "a");
-        assert_eq!(events[1].0, "b");
-
-        // Sync helper variant.
-        let mut buf2: EventBuffer<InMemoryTestEvent> = EventBuffer::new();
-        let seq = buf2.push(InMemoryTestEvent("gated".to_string()));
-        let provisional = Provisional::new("uri".to_string(), seq);
-        let uri = save_buffer_and_confirm(&persister, &mut buf2, provisional)
-            .expect("save_buffer_and_confirm succeeds");
+        let uri = provisional.confirm(&buf).unwrap_or_else(|_| panic!("confirmed"));
         assert_eq!(uri, "uri");
-        assert!(buf2.is_empty());
 
-        // Async equivalents.
-        let async_persister: InMemoryAsyncPersister<InMemoryTestEvent> =
-            InMemoryAsyncPersister::default();
-        let mut buf3: EventBuffer<InMemoryTestEvent> = EventBuffer::new();
-        buf3.push(InMemoryTestEvent("x".to_string()));
-        let seq = buf3.push(InMemoryTestEvent("y".to_string()));
+        // Async drain into an Arc<Mutex<Vec<E>>>: identical shape, just
+        // awaiting the write. Same EventBuffer<E> type, same Provisional<T>.
+        let mut buf: EventBuffer<String> = EventBuffer::new();
+        let seq = buf.push("only".to_string());
         let provisional = Provisional::new(7_u32, seq);
-        let inner = save_buffer_and_confirm_async(&async_persister, &mut buf3, provisional)
-            .await
-            .expect("save_buffer_and_confirm_async succeeds");
+
+        let storage = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
+        loop {
+            let Some(event) = buf.peek().next().cloned() else { break };
+            storage.lock().await.push(event);
+            buf.commit(1);
+        }
+        assert_eq!(storage.lock().await.as_slice(), ["only"]);
+        let inner = provisional.confirm(&buf).unwrap_or_else(|_| panic!("confirmed"));
         assert_eq!(inner, 7);
-        assert!(buf3.is_empty());
-        let async_events: Vec<InMemoryTestEvent> =
-            async_persister.load().await.expect("load async").collect();
-        assert_eq!(async_events.len(), 2);
-        assert_eq!(async_events[1].0, "y");
     }
 }
