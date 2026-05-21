@@ -363,3 +363,54 @@ describe("Validation", () => {
         });
     });
 });
+
+describe("ProvisionalConfirmError variants", () => {
+    // The three ProvisionalConfirmError variants must each be reachable
+    // through the FFI layer so foreign code can discriminate.
+    function stageProvisional(): {
+        provisional: payjoin.ProvisionalInitialized;
+        buf: payjoin.ReceiverEventBuffer;
+    } {
+        const buf = payjoin.ReceiverEventBuffer.new();
+        const provisional = new payjoin.ReceiverBuilder(
+            "tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4",
+            "https://example.com",
+            ohttpKeys(),
+        ).build(buf);
+        return { provisional, buf };
+    }
+
+    test("confirm before drain returns NotYetPersisted", () => {
+        const { provisional, buf } = stageProvisional();
+        // Drain has NOT happened — committed_count == 0, stamp.seq == 1.
+        assert.throws(
+            () => provisional.confirm(buf),
+            (err: Error) =>
+                err instanceof payjoin.ProvisionalConfirmError.NotYetPersisted,
+        );
+    });
+
+    test("confirm against fresh buffer returns WrongBuffer", () => {
+        const { provisional, buf } = stageProvisional();
+        const persister = new InMemoryReceiverPersister();
+        persister.drain(buf); // commit so original buffer WOULD confirm
+        const unrelated = payjoin.ReceiverEventBuffer.new();
+        assert.throws(
+            () => provisional.confirm(unrelated),
+            (err: Error) =>
+                err instanceof payjoin.ProvisionalConfirmError.WrongBuffer,
+        );
+    });
+
+    test("confirm twice returns AlreadyConsumed", () => {
+        const { provisional, buf } = stageProvisional();
+        const persister = new InMemoryReceiverPersister();
+        persister.drain(buf);
+        provisional.confirm(buf); // first call succeeds and consumes
+        assert.throws(
+            () => provisional.confirm(buf),
+            (err: Error) =>
+                err instanceof payjoin.ProvisionalConfirmError.AlreadyConsumed,
+        );
+    });
+});

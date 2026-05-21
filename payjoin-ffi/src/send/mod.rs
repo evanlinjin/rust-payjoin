@@ -22,7 +22,9 @@ pub mod error;
 /// Caller-owned, sans-IO event buffer for sender session events.
 ///
 /// Action methods push events into this buffer; the caller drains it through
-/// their storage (sync or async).
+/// their storage (sync or async). The buffer carries a process-unique id so
+/// [`ProvisionalWithReplyKey`] can refuse to confirm against an unrelated
+/// buffer (see [`crate::ProvisionalConfirmError::WrongBuffer`]).
 #[derive(uniffi::Object)]
 pub struct SenderEventBuffer {
     pub(crate) inner: Mutex<payjoin::persist::EventBuffer<payjoin::send::v2::SessionEvent>>,
@@ -175,7 +177,13 @@ impl SenderReplayResult {
     /// matches the number of replayed events. Equivalent to
     /// [`SenderEventBuffer::after_replay`] with [`Self::event_count`], but
     /// avoids the two-step ceremony at the call site.
-    pub fn into_buffer(&self) -> Arc<SenderEventBuffer> {
+    ///
+    /// Each call returns a **new** buffer with a **fresh** id — call this
+    /// once per session-resume and reuse the returned buffer for the
+    /// session's lifetime. Calling it twice yields two unrelated buffers,
+    /// and `confirm` will reject any `Provisional` minted against the other
+    /// with `WrongBuffer`.
+    pub fn new_event_buffer(&self) -> Arc<SenderEventBuffer> {
         SenderEventBuffer::after_replay(self.event_count)
     }
 }
@@ -390,6 +398,9 @@ impl SenderBuilder {
 /// The directory cannot be polled until the producing `Created` event has been
 /// durably persisted in the same [`SenderEventBuffer`] this provisional was
 /// minted against. Drain the buffer, then call [`Self::confirm`].
+///
+/// See [`ProvisionalConfirmError`] for the failure modes and lock-ordering
+/// notes that apply to all `Provisional*::confirm` methods.
 #[derive(uniffi::Object)]
 pub struct ProvisionalWithReplyKey {
     inner: Mutex<

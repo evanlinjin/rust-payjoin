@@ -262,5 +262,44 @@ class TestValidation(unittest.TestCase):
             payjoin.SenderBuilder("not-a-psbt", uri)
 
 
+class TestProvisionalConfirmErrors(unittest.TestCase):
+    """The three ProvisionalConfirmError variants must each be reachable
+    through the FFI layer so foreign code can discriminate."""
+
+    def _stage_provisional(self):
+        """Mint a ProvisionalInitialized without draining or confirming."""
+        buf = payjoin.ReceiverEventBuffer()
+        provisional = payjoin.ReceiverBuilder(
+            "tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4",
+            "https://example.com",
+            _ohttp_keys(),
+        ).build(buf)
+        return provisional, buf
+
+    def test_confirm_before_drain_returns_not_yet_persisted(self):
+        provisional, buf = self._stage_provisional()
+        # Drain has NOT happened — buf.committed_count() == 0, stamp.seq == 1.
+        with self.assertRaises(payjoin.ProvisionalConfirmError.NotYetPersisted):
+            provisional.confirm(buf)
+
+    def test_confirm_against_fresh_buffer_returns_wrong_buffer(self):
+        provisional, buf = self._stage_provisional()
+        persister = InMemoryReceiverPersister()
+        persister.drain(buf)  # commit so the original buffer WOULD confirm
+        unrelated_buf = payjoin.ReceiverEventBuffer()
+        with self.assertRaises(payjoin.ProvisionalConfirmError.WrongBuffer):
+            provisional.confirm(unrelated_buf)
+
+    def test_confirm_twice_returns_already_consumed(self):
+        provisional, buf = self._stage_provisional()
+        persister = InMemoryReceiverPersister()
+        persister.drain(buf)
+        # First confirm consumes the provisional successfully.
+        _ = provisional.confirm(buf)
+        # Second confirm finds an empty slot.
+        with self.assertRaises(payjoin.ProvisionalConfirmError.AlreadyConsumed):
+            provisional.confirm(buf)
+
+
 if __name__ == "__main__":
     unittest.main()

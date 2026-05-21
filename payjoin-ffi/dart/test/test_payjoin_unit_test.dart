@@ -316,4 +316,52 @@ void main() {
       );
     });
   });
+
+  group("ProvisionalConfirmError variants", () {
+    // The three ProvisionalConfirmError variants must each be reachable
+    // through the FFI layer so foreign code can discriminate.
+    ({
+      payjoin.ProvisionalInitialized provisional,
+      payjoin.ReceiverEventBuffer buf,
+    }) stageProvisional() {
+      final buf = payjoin.ReceiverEventBuffer();
+      final provisional = payjoin.ReceiverBuilder(
+        address: "tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4",
+        directory: "https://example.com",
+        ohttpKeys: _ohttpKeys(),
+      ).build(buf: buf);
+      return (provisional: provisional, buf: buf);
+    }
+
+    test("confirm before drain returns NotYetPersisted", () {
+      final s = stageProvisional();
+      // Drain has NOT happened — committed_count == 0, stamp.seq == 1.
+      expect(
+        () => s.provisional.confirm(buf: s.buf),
+        throwsA(isA<payjoin.NotYetPersistedProvisionalConfirmException>()),
+      );
+    });
+
+    test("confirm against fresh buffer returns WrongBuffer", () {
+      final s = stageProvisional();
+      final persister = InMemoryReceiverPersister();
+      persister.drain(s.buf); // commit so original buffer WOULD confirm
+      final unrelated = payjoin.ReceiverEventBuffer();
+      expect(
+        () => s.provisional.confirm(buf: unrelated),
+        throwsA(isA<payjoin.WrongBufferProvisionalConfirmException>()),
+      );
+    });
+
+    test("confirm twice returns AlreadyConsumed", () {
+      final s = stageProvisional();
+      final persister = InMemoryReceiverPersister();
+      persister.drain(s.buf);
+      s.provisional.confirm(buf: s.buf); // first call consumes
+      expect(
+        () => s.provisional.confirm(buf: s.buf),
+        throwsA(isA<payjoin.AlreadyConsumedProvisionalConfirmException>()),
+      );
+    });
+  });
 }

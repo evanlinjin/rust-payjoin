@@ -34,8 +34,9 @@ pub mod error;
 ///
 /// Action methods push events into this buffer; the caller drains it through
 /// their storage (sync or async). The buffer carries a process-unique id so
-/// [`ProvisionalInitialized`] can refuse to confirm against an unrelated
-/// buffer.
+/// [`ProvisionalInitialized`] and [`ProvisionalPayjoinProposal`] can refuse
+/// to confirm against an unrelated buffer (see
+/// [`crate::ProvisionalConfirmError::WrongBuffer`]).
 #[derive(uniffi::Object)]
 pub struct ReceiverEventBuffer {
     pub(crate) inner: Mutex<payjoin::persist::EventBuffer<payjoin::receive::v2::SessionEvent>>,
@@ -88,13 +89,8 @@ impl ReceiverEventBuffer {
 /// durably persisted in the same [`ReceiverEventBuffer`] this provisional was
 /// minted against. Drain the buffer, then call [`Self::confirm`].
 ///
-/// # Lock ordering
-///
-/// `confirm` acquires this provisional's internal mutex and then the
-/// supplied buffer's mutex. Do **not** call `buf.peek()` / `buf.commit()` /
-/// any other action method that touches `buf` from a callback invoked
-/// inside `confirm` — there are no callbacks today, but if foreign code
-/// extends this, that path would deadlock.
+/// See [`ProvisionalConfirmError`] for the failure modes and lock-ordering
+/// notes that apply to all `Provisional*::confirm` methods.
 #[derive(uniffi::Object)]
 pub struct ProvisionalInitialized {
     inner: Mutex<
@@ -261,7 +257,13 @@ impl ReceiverReplayResult {
     /// matches the number of replayed events. Equivalent to
     /// [`ReceiverEventBuffer::after_replay`] with [`Self::event_count`], but
     /// avoids the two-step ceremony at the call site.
-    pub fn into_buffer(&self) -> Arc<ReceiverEventBuffer> {
+    ///
+    /// Each call returns a **new** buffer with a **fresh** id — call this
+    /// once per session-resume and reuse the returned buffer for the
+    /// session's lifetime. Calling it twice yields two unrelated buffers,
+    /// and `confirm` will reject any `Provisional` minted against the other
+    /// with `WrongBuffer`.
+    pub fn new_event_buffer(&self) -> Arc<ReceiverEventBuffer> {
         ReceiverEventBuffer::after_replay(self.event_count)
     }
 }
@@ -1193,6 +1195,9 @@ impl ProvisionalProposal {
 /// `FinalizedProposal` event has been durably persisted in the same
 /// [`ReceiverEventBuffer`] this provisional was minted against. Drain the
 /// buffer, then call [`Self::confirm`].
+///
+/// See [`ProvisionalConfirmError`] for the failure modes and lock-ordering
+/// notes that apply to all `Provisional*::confirm` methods.
 #[derive(uniffi::Object)]
 pub struct ProvisionalPayjoinProposal {
     inner: Mutex<

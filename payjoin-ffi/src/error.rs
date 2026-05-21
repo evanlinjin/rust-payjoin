@@ -61,6 +61,14 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for ForeignError {
 /// `ProvisionalWithReplyKey::confirm`, and `ProvisionalPayjoinProposal::confirm`.
 /// Shared between receiver and sender — the confirm semantics are identical
 /// regardless of which side staged.
+///
+/// # Lock ordering (applies to all `Provisional*::confirm` implementations)
+///
+/// All three `confirm` methods acquire the provisional's internal mutex
+/// first, then the supplied buffer's mutex. There are no foreign callbacks
+/// invoked during confirm today, but if a future change introduces one, do
+/// **not** call `buf.peek()` / `buf.commit()` / any other action method that
+/// touches `buf` from within that callback — that path would deadlock.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum ProvisionalConfirmError {
     /// The provisional was already confirmed and consumed.
