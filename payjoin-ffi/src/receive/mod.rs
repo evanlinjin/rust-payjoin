@@ -11,7 +11,9 @@ use payjoin::bitcoin::psbt::Psbt;
 use payjoin::bitcoin::FeeRate;
 
 use crate::error::ForeignError;
-pub use crate::error::{FfiValidationError, ImplementationError, SerdeJsonError};
+pub use crate::error::{
+    FfiValidationError, ImplementationError, ProvisionalConfirmError, SerdeJsonError,
+};
 use crate::ohttp::OhttpKeys;
 use crate::receive::error::ReceiverReplayError;
 use crate::uri::error::FeeRateError;
@@ -92,20 +94,6 @@ pub struct ProvisionalInitialized {
             >,
         >,
     >,
-}
-
-/// Error returned by [`ProvisionalInitialized::confirm`].
-#[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum ProvisionalConfirmError {
-    /// The provisional was already confirmed and consumed.
-    #[error("Provisional was already confirmed and consumed")]
-    AlreadyConsumed,
-    /// The producing event is not yet durable in the supplied buffer.
-    /// Drain more events and retry, or check that the correct buffer is being
-    /// passed (a freshly-constructed or unrelated buffer is rejected even if
-    /// its committed count is sufficient).
-    #[error("Event not yet persisted in buffer; drain and retry")]
-    NotYetPersisted,
 }
 
 #[uniffi::export]

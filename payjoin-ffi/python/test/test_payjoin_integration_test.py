@@ -310,10 +310,9 @@ class TestPayjoin(unittest.IsolatedAsyncioTestCase):
             # Create a funded PSBT (not broadcasted) to address with amount given in the pj_uri
             pj_uri = session.pj_uri()
             psbt = build_sweep_psbt(self.sender, pj_uri)
-            req_ctx: WithReplyKey = SenderBuilder(psbt, pj_uri).build_recommended(
-                1000, sender_buf
-            )
+            provisional = SenderBuilder(psbt, pj_uri).build_recommended(1000, sender_buf)
             sender_persister.drain(sender_buf)
+            req_ctx: WithReplyKey = provisional.confirm(sender_buf)
             request: RequestOhttpContext = req_ctx.create_v2_post_request(ohttp_relay)
             response = await agent.post(
                 url=request.request.url,

@@ -46,6 +46,35 @@ Future<_BuiltReceiver> _buildReceiverAsync(
   return _BuiltReceiver(provisional.confirm(buf: buf), buf);
 }
 
+/// Build a `WithReplyKey` sender: stage into the buffer, drain, confirm.
+payjoin.WithReplyKey _buildSender(
+  String psbt,
+  payjoin.PjUri uri,
+  InMemorySenderPersister persister,
+  payjoin.SenderEventBuffer buf,
+) {
+  final provisional = payjoin.SenderBuilder(psbt: psbt, uri: uri).buildRecommended(
+    minFeeRateSatPerKwu: BigInt.from(1000),
+    buf: buf,
+  );
+  persister.drain(buf);
+  return provisional.confirm(buf: buf);
+}
+
+Future<payjoin.WithReplyKey> _buildSenderAsync(
+  String psbt,
+  payjoin.PjUri uri,
+  InMemorySenderPersisterAsync persister,
+  payjoin.SenderEventBuffer buf,
+) async {
+  final provisional = payjoin.SenderBuilder(psbt: psbt, uri: uri).buildRecommended(
+    minFeeRateSatPerKwu: BigInt.from(1000),
+    buf: buf,
+  );
+  await persister.drain(buf);
+  return provisional.confirm(buf: buf);
+}
+
 void main() {
   group('Test URIs', () {
     test('Test todo url encoded', () {
@@ -122,9 +151,7 @@ void main() {
       final sendPersister = InMemorySenderPersister();
       final sendBuf = payjoin.SenderEventBuffer();
       final psbt = payjoin.originalPsbt();
-      payjoin.SenderBuilder(psbt: psbt, uri: uri)
-          .buildRecommended(minFeeRateSatPerKwu: BigInt.from(1000), buf: sendBuf);
-      sendPersister.drain(sendBuf);
+      _buildSender(psbt, uri, sendPersister, sendBuf);
 
       final senderResult = payjoin.replaySenderEventLog(
         events: sendPersister.load(),
@@ -191,12 +218,7 @@ void main() {
       final sendPersister = InMemorySenderPersister();
       final sendBuf = payjoin.SenderEventBuffer();
       final psbt = payjoin.originalPsbt();
-      final withReplyKey = payjoin.SenderBuilder(psbt: psbt, uri: uri)
-          .buildRecommended(
-            minFeeRateSatPerKwu: BigInt.from(1000),
-            buf: sendBuf,
-          );
-      sendPersister.drain(sendBuf);
+      final withReplyKey = _buildSender(psbt, uri, sendPersister, sendBuf);
 
       // Sender cancel always returns the fallback tx as raw bytes.
       final fallbackTx = withReplyKey.cancel(buf: sendBuf);
@@ -223,12 +245,12 @@ void main() {
       final sendPersister = InMemorySenderPersisterAsync();
       final sendBuf = payjoin.SenderEventBuffer();
       final psbt = payjoin.originalPsbt();
-      final withReplyKey = payjoin.SenderBuilder(psbt: psbt, uri: uri)
-          .buildRecommended(
-            minFeeRateSatPerKwu: BigInt.from(1000),
-            buf: sendBuf,
-          );
-      await sendPersister.drain(sendBuf);
+      final withReplyKey = await _buildSenderAsync(
+        psbt,
+        uri,
+        sendPersister,
+        sendBuf,
+      );
 
       final fallbackTx = withReplyKey.cancel(buf: sendBuf);
       await sendPersister.drain(sendBuf);
@@ -272,11 +294,7 @@ void main() {
       final sendPersister = InMemorySenderPersisterAsync();
       final sendBuf = payjoin.SenderEventBuffer();
       final psbt = payjoin.originalPsbt();
-      payjoin.SenderBuilder(psbt: psbt, uri: uri).buildRecommended(
-        minFeeRateSatPerKwu: BigInt.from(1000),
-        buf: sendBuf,
-      );
-      await sendPersister.drain(sendBuf);
+      await _buildSenderAsync(psbt, uri, sendPersister, sendBuf);
 
       final events = await sendPersister.load();
       final senderResult = payjoin.replaySenderEventLog(events: events);

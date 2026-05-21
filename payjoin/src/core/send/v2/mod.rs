@@ -42,7 +42,7 @@ use crate::core::Url;
 use crate::error::{InternalReplayError, ReplayError};
 use crate::hpke::{decrypt_message_b, encrypt_message_a, HpkeSecretKey};
 use crate::ohttp::{ohttp_encapsulate, process_get_res, process_post_res};
-use crate::persist::{ApiError, EventBuffer, OptionalTransitionOutcome};
+use crate::persist::{ApiError, EventBuffer, OptionalTransitionOutcome, Provisional};
 use crate::uri::v2::PjParam;
 use crate::uri::ShortId;
 use crate::{HpkeKeyPair, IntoUrl, PjUri, Request};
@@ -108,11 +108,17 @@ impl SenderBuilder {
     // The minfeerate parameter is set if the contribution is available in change.
     //
     // This method fails if no recommendation can be made or if the PSBT is malformed.
+    ///
+    /// Stages the session for persistence: pushes a `Created` event into `buf`
+    /// and returns a [`Provisional`] guarding [`Sender<WithReplyKey>`]. The
+    /// session is not externally observable (i.e. cannot post to the directory)
+    /// until the buffer's `Created` entry is durably persisted and the
+    /// provisional is confirmed.
     pub fn build_recommended(
         self,
         min_fee_rate: FeeRate,
         buf: &mut EventBuffer<SessionEvent>,
-    ) -> Result<Sender<WithReplyKey>, BuildSenderError> {
+    ) -> Result<Provisional<Sender<WithReplyKey>>, BuildSenderError> {
         let psbt_ctx =
             self.psbt_ctx_builder.build_recommended(min_fee_rate, self.output_substitution)?;
         Ok(Self::v2_sender_from_psbt_ctx(self.pj_param, psbt_ctx, buf))
@@ -131,6 +137,9 @@ impl SenderBuilder {
     /// If this option is true and a transaction with change amount lower than fee
     /// contribution is provided then instead of returning error the fee contribution will
     /// be just lowered in the request to match the change amount.
+    ///
+    /// Returns a [`Provisional`] guarding the sender; see
+    /// [`Self::build_recommended`] for the persist-before-expose semantics.
     pub fn build_with_additional_fee(
         self,
         max_fee_contribution: bitcoin::Amount,
@@ -138,7 +147,7 @@ impl SenderBuilder {
         min_fee_rate: FeeRate,
         clamp_fee_contribution: bool,
         buf: &mut EventBuffer<SessionEvent>,
-    ) -> Result<Sender<WithReplyKey>, BuildSenderError> {
+    ) -> Result<Provisional<Sender<WithReplyKey>>, BuildSenderError> {
         let psbt_ctx = self.psbt_ctx_builder.build_with_additional_fee(
             max_fee_contribution,
             change_index,
@@ -153,26 +162,30 @@ impl SenderBuilder {
     ///
     /// While it's generally better to offer some contribution some users may wish not to.
     /// This function disables contribution.
+    ///
+    /// Returns a [`Provisional`] guarding the sender; see
+    /// [`Self::build_recommended`] for the persist-before-expose semantics.
     pub fn build_non_incentivizing(
         self,
         min_fee_rate: FeeRate,
         buf: &mut EventBuffer<SessionEvent>,
-    ) -> Result<Sender<WithReplyKey>, BuildSenderError> {
+    ) -> Result<Provisional<Sender<WithReplyKey>>, BuildSenderError> {
         let psbt_ctx = self
             .psbt_ctx_builder
             .build_non_incentivizing(min_fee_rate, self.output_substitution)?;
         Ok(Self::v2_sender_from_psbt_ctx(self.pj_param, psbt_ctx, buf))
     }
 
-    /// Helper that wraps a V1 build result in a V2 Sender, pushing the Created event into `buf`.
+    /// Helper that wraps a V1 build result in a V2 Sender, pushing the Created event into `buf`
+    /// and stamping the resulting [`Sender`] as a [`Provisional`].
     fn v2_sender_from_psbt_ctx(
         pj_param: PjParam,
         psbt_ctx: PsbtContext,
         buf: &mut EventBuffer<SessionEvent>,
-    ) -> Sender<WithReplyKey> {
+    ) -> Provisional<Sender<WithReplyKey>> {
         let sender = Sender::new(pj_param, psbt_ctx);
-        buf.push(SessionEvent::Created(Box::new(sender.session_context.clone())));
-        sender
+        let stamp = buf.push(SessionEvent::Created(Box::new(sender.session_context.clone())));
+        Provisional::new(sender, stamp)
     }
 }
 

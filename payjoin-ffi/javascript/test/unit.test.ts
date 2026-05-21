@@ -56,6 +56,35 @@ async function buildReceiverAsync(
     return { initialized: provisional.confirm(buf), buf };
 }
 
+/** Build a `WithReplyKey` sender: stage into a buffer, drain, confirm. */
+function buildSender(
+    psbt: string,
+    uri: payjoin.PjUri,
+    persister: InMemorySenderPersister,
+    buf: payjoin.SenderEventBuffer,
+): payjoin.WithReplyKey {
+    const provisional = new payjoin.SenderBuilder(psbt, uri).buildRecommended(
+        BigInt(1000),
+        buf,
+    );
+    persister.drain(buf);
+    return provisional.confirm(buf);
+}
+
+async function buildSenderAsync(
+    psbt: string,
+    uri: payjoin.PjUri,
+    persister: InMemorySenderPersisterAsync,
+    buf: payjoin.SenderEventBuffer,
+): Promise<payjoin.WithReplyKey> {
+    const provisional = new payjoin.SenderBuilder(psbt, uri).buildRecommended(
+        BigInt(1000),
+        buf,
+    );
+    await persister.drain(buf);
+    return provisional.confirm(buf);
+}
+
 describe("URI tests", () => {
     test("URL encoded payjoin parameter", () => {
         const uri =
@@ -133,11 +162,7 @@ describe("Persistence tests", () => {
         const senderPersister = new InMemorySenderPersister();
         const senderBuf = payjoin.SenderEventBuffer.new();
         const psbt = testUtils.originalPsbt();
-        const withReplyKey = new payjoin.SenderBuilder(psbt, uri).buildRecommended(
-            BigInt(1000),
-            senderBuf,
-        );
-        senderPersister.drain(senderBuf);
+        const withReplyKey = buildSender(psbt, uri, senderPersister, senderBuf);
 
         assert.ok(withReplyKey, "Sender should be created successfully");
 
@@ -200,11 +225,7 @@ describe("Sender cancel tests", () => {
         const senderPersister = new InMemorySenderPersister();
         const senderBuf = payjoin.SenderEventBuffer.new();
         const psbt = testUtils.originalPsbt();
-        const withReplyKey = new payjoin.SenderBuilder(psbt, uri).buildRecommended(
-            BigInt(1000),
-            senderBuf,
-        );
-        senderPersister.drain(senderBuf);
+        const withReplyKey = buildSender(psbt, uri, senderPersister, senderBuf);
 
         // Sender cancel always returns the fallback tx as raw bytes.
         const fallbackTx = withReplyKey.cancel(senderBuf);
@@ -234,11 +255,12 @@ describe("Sender cancel tests", () => {
         const senderPersister = new InMemorySenderPersisterAsync();
         const senderBuf = payjoin.SenderEventBuffer.new();
         const psbt = testUtils.originalPsbt();
-        const withReplyKey = new payjoin.SenderBuilder(psbt, uri).buildRecommended(
-            BigInt(1000),
+        const withReplyKey = await buildSenderAsync(
+            psbt,
+            uri,
+            senderPersister,
             senderBuf,
         );
-        await senderPersister.drain(senderBuf);
 
         const fallbackTx = withReplyKey.cancel(senderBuf);
         await senderPersister.drain(senderBuf);
@@ -288,11 +310,12 @@ describe("Async Persistence tests", () => {
         const senderPersister = new InMemorySenderPersisterAsync();
         const senderBuf = payjoin.SenderEventBuffer.new();
         const psbt = testUtils.originalPsbt();
-        const withReplyKey = new payjoin.SenderBuilder(psbt, uri).buildRecommended(
-            BigInt(1000),
+        const withReplyKey = await buildSenderAsync(
+            psbt,
+            uri,
+            senderPersister,
             senderBuf,
         );
-        await senderPersister.drain(senderBuf);
 
         assert.ok(withReplyKey, "Sender should be created successfully");
     });

@@ -6,7 +6,7 @@ pub use error::{
     SenderApiError, SenderInputError,
 };
 
-pub use crate::error::{ImplementationError, SerdeJsonError};
+pub use crate::error::{ImplementationError, ProvisionalConfirmError, SerdeJsonError};
 use crate::ohttp::ClientResponse;
 use crate::request::Request;
 use crate::send::error::SenderReplayError;
@@ -306,21 +306,29 @@ impl SenderBuilder {
     }
 
     /// Build with recommended fee contribution. Pushes a `Created` event into
-    /// `buf`.
+    /// `buf` and returns a [`ProvisionalWithReplyKey`] guarding the sender.
+    /// The session is not externally observable (cannot post to the directory)
+    /// until the buffer's `Created` entry is durably persisted and the
+    /// provisional is confirmed.
     pub fn build_recommended(
         &self,
         min_fee_rate_sat_per_kwu: u64,
         buf: &SenderEventBuffer,
-    ) -> Result<Arc<WithReplyKey>, SenderInputError> {
+    ) -> Result<Arc<ProvisionalWithReplyKey>, SenderInputError> {
         let fee_rate = validate_fee_rate_sat_per_kwu(min_fee_rate_sat_per_kwu)?;
         let mut g = buf.inner.lock().expect("poisoned");
-        self.0.clone().build_recommended(fee_rate, &mut g).map(|s| Arc::new(s.into())).map_err(
-            |e: payjoin::send::BuildSenderError| SenderInputError::Build(Arc::new(e.into())),
-        )
+        self.0
+            .clone()
+            .build_recommended(fee_rate, &mut g)
+            .map(|p| Arc::new(ProvisionalWithReplyKey { inner: Mutex::new(Some(p)) }))
+            .map_err(|e: payjoin::send::BuildSenderError| {
+                SenderInputError::Build(Arc::new(e.into()))
+            })
     }
 
     /// Offer the receiver contribution to pay for his input. Pushes a `Created`
-    /// event into `buf`.
+    /// event into `buf` and returns a [`ProvisionalWithReplyKey`]; see
+    /// [`Self::build_recommended`] for the persist-before-expose semantics.
     pub fn build_with_additional_fee(
         &self,
         max_fee_contribution_sats: u64,
@@ -328,7 +336,7 @@ impl SenderBuilder {
         min_fee_rate_sat_per_kwu: u64,
         clamp_fee_contribution: bool,
         buf: &SenderEventBuffer,
-    ) -> Result<Arc<WithReplyKey>, SenderInputError> {
+    ) -> Result<Arc<ProvisionalWithReplyKey>, SenderInputError> {
         let max_fee_contribution = validate_amount_sat(max_fee_contribution_sats)?;
         let fee_rate = validate_fee_rate_sat_per_kwu(min_fee_rate_sat_per_kwu)?;
         let mut g = buf.inner.lock().expect("poisoned");
@@ -341,28 +349,73 @@ impl SenderBuilder {
                 clamp_fee_contribution,
                 &mut g,
             )
-            .map(|s| Arc::new(s.into()))
+            .map(|p| Arc::new(ProvisionalWithReplyKey { inner: Mutex::new(Some(p)) }))
             .map_err(|e: payjoin::send::BuildSenderError| {
                 SenderInputError::Build(Arc::new(e.into()))
             })
     }
 
     /// Perform Payjoin without incentivizing the payee. Pushes a `Created`
-    /// event into `buf`.
+    /// event into `buf` and returns a [`ProvisionalWithReplyKey`]; see
+    /// [`Self::build_recommended`] for the persist-before-expose semantics.
     pub fn build_non_incentivizing(
         &self,
         min_fee_rate_sat_per_kwu: u64,
         buf: &SenderEventBuffer,
-    ) -> Result<Arc<WithReplyKey>, SenderInputError> {
+    ) -> Result<Arc<ProvisionalWithReplyKey>, SenderInputError> {
         let fee_rate = validate_fee_rate_sat_per_kwu(min_fee_rate_sat_per_kwu)?;
         let mut g = buf.inner.lock().expect("poisoned");
         self.0
             .clone()
             .build_non_incentivizing(fee_rate, &mut g)
-            .map(|s| Arc::new(s.into()))
+            .map(|p| Arc::new(ProvisionalWithReplyKey { inner: Mutex::new(Some(p)) }))
             .map_err(|e: payjoin::send::BuildSenderError| {
                 SenderInputError::Build(Arc::new(e.into()))
             })
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Provisional<Sender<WithReplyKey>>
+// -----------------------------------------------------------------------------
+
+/// A sender staged for persistence by [`SenderBuilder::build_recommended`] (or
+/// the other `build_*` methods).
+///
+/// The directory cannot be polled until the producing `Created` event has been
+/// durably persisted in the same [`SenderEventBuffer`] this provisional was
+/// minted against. Drain the buffer, then call [`Self::confirm`].
+#[derive(uniffi::Object)]
+pub struct ProvisionalWithReplyKey {
+    inner: Mutex<
+        Option<
+            payjoin::persist::Provisional<
+                payjoin::send::v2::Sender<payjoin::send::v2::WithReplyKey>,
+            >,
+        >,
+    >,
+}
+
+#[uniffi::export]
+impl ProvisionalWithReplyKey {
+    /// Confirm against `buf`. Returns the [`WithReplyKey`] sender if the
+    /// producing event is durable in `buf`, otherwise returns
+    /// [`ProvisionalConfirmError::NotYetPersisted`] and leaves the provisional
+    /// reusable for retry.
+    pub fn confirm(
+        &self,
+        buf: &SenderEventBuffer,
+    ) -> Result<Arc<WithReplyKey>, ProvisionalConfirmError> {
+        let mut slot = self.inner.lock().expect("poisoned");
+        let p = slot.take().ok_or(ProvisionalConfirmError::AlreadyConsumed)?;
+        let buf_g = buf.inner.lock().expect("poisoned");
+        match p.confirm(&*buf_g) {
+            Ok(sender) => Ok(Arc::new(sender.into())),
+            Err(returned) => {
+                *slot = Some(returned);
+                Err(ProvisionalConfirmError::NotYetPersisted)
+            }
+        }
     }
 }
 

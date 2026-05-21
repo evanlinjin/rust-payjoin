@@ -590,12 +590,10 @@ void main() {
       // Create a funded PSBT (not broadcasted) to address with amount given in the pj_uri
       var pj_uri = session.pjUri();
       var psbt = build_sweep_psbt(sender, pj_uri);
-      payjoin.WithReplyKey req_ctx =
-          payjoin.SenderBuilder(psbt: psbt, uri: pj_uri).buildRecommended(
-            minFeeRateSatPerKwu: 1000,
-            buf: sender_buf,
-          );
+      final provisionalSender = payjoin.SenderBuilder(psbt: psbt, uri: pj_uri)
+          .buildRecommended(minFeeRateSatPerKwu: 1000, buf: sender_buf);
       sender_persister.drain(sender_buf);
+      payjoin.WithReplyKey req_ctx = provisionalSender.confirm(buf: sender_buf);
       payjoin.RequestOhttpContext request = req_ctx.createV2PostRequest(
         ohttpRelay: ohttp_relay,
       );

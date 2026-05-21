@@ -618,11 +618,12 @@ async function testIntegrationV2ToV2(): Promise<void> {
 
     const pjUri = session.pjUri();
     const psbt = buildSweepPsbt(sender, pjUri);
-    const reqCtx = new payjoin.SenderBuilder(psbt, pjUri).buildRecommended(
+    const provisionalSender = new payjoin.SenderBuilder(psbt, pjUri).buildRecommended(
         1000n,
         senderBuf,
     );
     senderPersister.drain(senderBuf);
+    const reqCtx = provisionalSender.confirm(senderBuf);
 
     const request = reqCtx.createV2PostRequest(ohttpRelay);
     const response = await fetch(request.request.url, {

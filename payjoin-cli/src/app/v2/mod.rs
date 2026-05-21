@@ -245,10 +245,13 @@ impl AppTrait for App {
                             SenderPersister::new(self.db.clone(), bip21, receiver_pubkey)?;
                         let psbt = self.create_original_psbt(&address, amount, fee_rate)?;
                         let mut buf = EventBuffer::new();
-                        let sender =
+                        let provisional =
                             SenderBuilder::from_parts(psbt, pj_param, &address, Some(amount))
                                 .build_recommended(fee_rate, &mut buf)?;
                         persister.drain(&mut buf)?;
+                        let sender = provisional
+                            .confirm(&buf)
+                            .expect("staged sender should confirm after drain");
 
                         (SendSession::WithReplyKey(sender), persister)
                     }

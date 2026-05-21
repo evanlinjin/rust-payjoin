@@ -318,6 +318,9 @@ mod integration {
                 let expired_req_ctx = SenderBuilder::new(psbt, expired_receiver.pj_uri())
                     .build_non_incentivizing(FeeRate::BROADCAST_MIN, &mut send_buf)?;
                 send_persister.drain(&mut send_buf)?;
+                let expired_req_ctx = expired_req_ctx
+                    .confirm(&send_buf)
+                    .expect("staged sender should confirm after drain");
 
                 match expired_req_ctx.create_v2_post_request(services.ohttp_relay_url().as_str()) {
                     // Internal error types are private, so check against a string
@@ -400,6 +403,8 @@ mod integration {
                 let req_ctx = SenderBuilder::new(psbt, pj_uri)
                     .build_recommended(FeeRate::BROADCAST_MIN, &mut send_buf)?;
                 sender_persister.drain(&mut send_buf)?;
+                let req_ctx =
+                    req_ctx.confirm(&send_buf).expect("staged sender should confirm after drain");
                 let (Request { url, body, content_type, .. }, send_ctx) =
                     req_ctx.create_v2_post_request(services.ohttp_relay_url().as_str())?;
                 let response =
@@ -893,6 +898,8 @@ mod integration {
             let req_ctx = SenderBuilder::new(psbt, pj_uri)
                 .build_recommended(FeeRate::BROADCAST_MIN, &mut send_buf)?;
             send_persister.drain(&mut send_buf)?;
+            let req_ctx =
+                req_ctx.confirm(&send_buf).expect("staged sender should confirm after drain");
             let (Request { url, body, content_type, .. }, send_ctx) =
                 req_ctx.create_v2_post_request(services.ohttp_relay_url().as_str())?;
             let response =

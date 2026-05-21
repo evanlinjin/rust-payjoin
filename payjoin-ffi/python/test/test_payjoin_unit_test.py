@@ -38,6 +38,19 @@ async def _build_receiver_async(address, persister):
     return provisional.confirm(buf), buf
 
 
+def _build_sender(psbt, uri, persister, buf):
+    """Build a `WithReplyKey` sender: stage into a buffer, drain, confirm."""
+    provisional = payjoin.SenderBuilder(psbt, uri).build_recommended(1000, buf)
+    persister.drain(buf)
+    return provisional.confirm(buf)
+
+
+async def _build_sender_async(psbt, uri, persister, buf):
+    provisional = payjoin.SenderBuilder(psbt, uri).build_recommended(1000, buf)
+    await persister.drain(buf)
+    return provisional.confirm(buf)
+
+
 class TestURIs(unittest.TestCase):
     def test_todo_url_encoded(self):
         uri = "bitcoin:12c6DSiU4Rq3P4ZxziKxzrL5LmMBrzjrJX?amount=1&pj=https://example.com?ciao"
@@ -86,8 +99,7 @@ class TestSenderPersistence(unittest.TestCase):
         send_persister = InMemorySenderPersister()
         send_buf = payjoin.SenderEventBuffer()
         psbt = payjoin.original_psbt()
-        payjoin.SenderBuilder(psbt, uri).build_recommended(1000, send_buf)
-        send_persister.drain(send_buf)
+        _build_sender(psbt, uri, send_persister, send_buf)
 
         result = payjoin.replay_sender_event_log(send_persister.load())
         self.assertTrue(result.state().is_WITH_REPLY_KEY())
@@ -123,8 +135,7 @@ class TestSenderAsyncPersistence(unittest.TestCase):
             send_persister = InMemorySenderPersisterAsync()
             send_buf = payjoin.SenderEventBuffer()
             psbt = payjoin.original_psbt()
-            payjoin.SenderBuilder(psbt, uri).build_recommended(1000, send_buf)
-            await send_persister.drain(send_buf)
+            await _build_sender_async(psbt, uri, send_persister, send_buf)
 
             events = await send_persister.load()
             result = payjoin.replay_sender_event_log(events)
@@ -181,10 +192,7 @@ class TestSenderCancel(unittest.TestCase):
         send_persister = InMemorySenderPersister()
         send_buf = payjoin.SenderEventBuffer()
         psbt = payjoin.original_psbt()
-        with_reply_key = payjoin.SenderBuilder(psbt, uri).build_recommended(
-            1000, send_buf
-        )
-        send_persister.drain(send_buf)
+        with_reply_key = _build_sender(psbt, uri, send_persister, send_buf)
 
         # Sender cancel always returns a fallback transaction (raw bytes).
         fallback_tx = with_reply_key.cancel(send_buf)
@@ -210,10 +218,9 @@ class TestSenderCancelAsync(unittest.TestCase):
             send_persister = InMemorySenderPersisterAsync()
             send_buf = payjoin.SenderEventBuffer()
             psbt = payjoin.original_psbt()
-            with_reply_key = payjoin.SenderBuilder(psbt, uri).build_recommended(
-                1000, send_buf
+            with_reply_key = await _build_sender_async(
+                psbt, uri, send_persister, send_buf
             )
-            await send_persister.drain(send_buf)
 
             fallback_tx = with_reply_key.cancel(send_buf)
             await send_persister.drain(send_buf)

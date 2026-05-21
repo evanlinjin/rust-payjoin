@@ -56,3 +56,19 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for ForeignError {
         Self::InternalError("Unexpected Uniffi callback error".to_string())
     }
 }
+
+/// Error returned by `ProvisionalInitialized::confirm` and
+/// `ProvisionalWithReplyKey::confirm`. Shared between receiver and sender —
+/// the confirm semantics are identical regardless of which side staged.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum ProvisionalConfirmError {
+    /// The provisional was already confirmed and consumed.
+    #[error("Provisional was already confirmed and consumed")]
+    AlreadyConsumed,
+    /// The producing event is not yet durable in the supplied buffer.
+    /// Drain more events and retry, or check that the correct buffer is being
+    /// passed (a freshly-constructed or unrelated buffer is rejected even if
+    /// its committed count is sufficient).
+    #[error("Event not yet persisted in buffer; drain and retry")]
+    NotYetPersisted,
+}
