@@ -553,7 +553,7 @@ mod test {
     use payjoin_test_utils::{BoxError, EXAMPLE_URL, KEM, KEY_ID, PARSED_ORIGINAL_PSBT, SYMMETRIC};
 
     use super::*;
-    use crate::persist::{InMemoryPersister, SessionPersister};
+    use crate::persist::InMemoryPersister;
     use crate::receive::v2::ReceiverBuilder;
     use crate::time::Time;
     use crate::OhttpKeys;

@@ -3,9 +3,8 @@ use serde::{Deserialize, Serialize};
 use super::{ReceiveSession, SessionContext};
 use crate::error::{InternalReplayError, ReplayError};
 use crate::output_substitution::OutputSubstitution;
-use crate::persist::SessionPersister;
 use crate::receive::{InputPair, JsonReply, OriginalPayload, PsbtContext};
-use crate::{ImplementationError, PjUri};
+use crate::PjUri;
 
 fn replay_events(
     mut logs: impl Iterator<Item = SessionEvent>,
@@ -35,30 +34,15 @@ fn construct_history(
     Ok(history)
 }
 
-/// Replay a receiver event log to get the receiver in its current state [ReceiveSession]
-/// and a session history [SessionHistory]
-pub fn replay_event_log<P>(
-    persister: &P,
-) -> Result<(ReceiveSession, SessionHistory), ReplayError<ReceiveSession, SessionEvent>>
-where
-    P: SessionPersister,
-    P::SessionEvent: Into<SessionEvent> + Clone,
-    P::SessionEvent: From<SessionEvent>,
-{
-    let logs = persister
-        .load()
-        .map_err(|e| InternalReplayError::PersistenceFailure(ImplementationError::new(e)))?;
-
-    let (receiver, session_events) = match replay_events(logs.map(|e| e.into())) {
-        Ok(r) => r,
-        Err(e) => {
-            persister.close().map_err(|ce| {
-                InternalReplayError::PersistenceFailure(ImplementationError::new(ce))
-            })?;
-            return Err(e);
-        }
-    };
-
+/// Fold a receiver event log into the current [`ReceiveSession`] and a
+/// [`SessionHistory`].
+///
+/// The caller provides events from their own storage — the library is
+/// sans-IO and has no opinion on where the log lives.
+pub fn replay_event_log(
+    events: impl IntoIterator<Item = SessionEvent>,
+) -> Result<(ReceiveSession, SessionHistory), ReplayError<ReceiveSession, SessionEvent>> {
+    let (receiver, session_events) = replay_events(events.into_iter())?;
     let history = construct_history(session_events)?;
     Ok((receiver, history))
 }
@@ -315,7 +299,7 @@ mod tests {
         for event in test.events.clone() {
             persister.save_event(event).expect("In memory persister shouldn't fail");
         }
-        verify_session_result(replay_event_log(&persister), test);
+        verify_session_result(replay_event_log(persister.load().unwrap()), test);
     }
 
     #[tokio::test]
@@ -344,7 +328,8 @@ mod tests {
         persister
             .save_event(SessionEvent::Created(session_context))
             .expect("in memory persister save should not fail");
-        let err = replay_event_log(&persister).expect_err("session should be expired");
+        let err =
+            replay_event_log(persister.load().unwrap()).expect_err("session should be expired");
         let expected_err: ReplayError<ReceiveSession, SessionEvent> =
             InternalReplayError::Expired(expiration).into();
         assert_eq!(err.to_string(), expected_err.to_string());
@@ -356,8 +341,8 @@ mod tests {
         persister
             .save_event(SessionEvent::CheckedBroadcastSuitability())
             .expect("in memory persister save should not fail");
-        assert!(!persister.inner.read().expect("session read should succeed").is_closed);
-        let err = replay_event_log(&persister).expect_err("session replay should be fail");
+        let err =
+            replay_event_log(persister.load().unwrap()).expect_err("session replay should be fail");
         let expected_err: ReplayError<ReceiveSession, SessionEvent> =
             InternalReplayError::InvalidEvent(
                 Box::new(SessionEvent::CheckedBroadcastSuitability()),
@@ -365,7 +350,6 @@ mod tests {
             )
             .into();
         assert_eq!(err.to_string(), expected_err.to_string());
-        assert!(persister.inner.read().expect("lock should not be poisoned").is_closed);
     }
 
     #[tokio::test]

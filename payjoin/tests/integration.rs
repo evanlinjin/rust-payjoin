@@ -204,9 +204,7 @@ mod integration {
         use payjoin::send::v2::{replay_event_log as replay_sender_event_log, SenderBuilder};
         use payjoin::send::ResponseError;
         use payjoin::{OhttpKeys, PjUri, UriExt};
-        use payjoin_test_utils::{
-            BoxSendSyncError, InMemoryPersister, SessionPersister, TestServices,
-        };
+        use payjoin_test_utils::{BoxSendSyncError, InMemoryPersister, TestServices};
         use reqwest::{Client, Response};
 
         use super::*;
@@ -468,7 +466,7 @@ mod integration {
                     "Protocol error: The receiver rejected the original PSBT."
                 );
 
-                let (session, session_history) = replay_receiver_event_log(&persister)?;
+                let (session, session_history) = replay_receiver_event_log(persister.load()?)?;
                 assert_eq!(session_history.status(), SessionStatus::Active);
                 let has_error = match session {
                     ReceiveSession::HasReplyableError(r) => r,
@@ -491,7 +489,7 @@ mod integration {
                 persister.drain(&mut buf)?;
 
                 // Ensure the session is closed properly
-                let (_, session_history) = replay_receiver_event_log(&persister)?;
+                let (_, session_history) = replay_receiver_event_log(persister.load()?)?;
                 assert_eq!(session_history.status(), SessionStatus::Failed);
 
                 // Check that we can read the error response as a sender
@@ -583,7 +581,7 @@ mod integration {
                 .expect("receiver should successfully monitor for the payment");
             recv_persister.drain(&mut buf)?;
 
-            let (_session, session_history) = replay_receiver_event_log(&recv_persister)?;
+            let (_session, session_history) = replay_receiver_event_log(recv_persister.load()?)?;
             assert_eq!(
                 recv_persister.load().unwrap().last(),
                 Some(payjoin::receive::v2::SessionEvent::Closed(payjoin::receive::v2::SessionOutcome::PayjoinProposalSent)),
@@ -650,7 +648,7 @@ mod integration {
 
             // Receiver session should have completed with a Success, along with information on the
             // sender signatures on the Payjoin that was broadcasted.
-            let (_session, session_history) = replay_receiver_event_log(&recv_persister)?;
+            let (_session, session_history) = replay_receiver_event_log(recv_persister.load()?)?;
             let sender_outpoint = session_history.fallback_tx().unwrap().input[0].previous_output;
             let sender_signatures = {
                 let sender_txin = broadcasted_transaction
@@ -735,7 +733,7 @@ mod integration {
 
             // Receiver session should have completed with a Success, along with information on the
             // sender signatures on the Payjoin that was broadcasted.
-            let (_session, session_history) = replay_receiver_event_log(&recv_persister)?;
+            let (_session, session_history) = replay_receiver_event_log(recv_persister.load()?)?;
             let sender_outpoint = session_history.fallback_tx().unwrap().input[0].previous_output;
             let sender_signatures = {
                 let sender_txin = broadcasted_transaction
@@ -817,7 +815,7 @@ mod integration {
 
             // Receiver session should have completed with a Success and a fallback session
             // outcome.
-            let (_session, session_history) = replay_receiver_event_log(&recv_persister)?;
+            let (_session, session_history) = replay_receiver_event_log(recv_persister.load()?)?;
             assert_eq!(
                 recv_persister.load().unwrap().last(),
                 Some(payjoin::receive::v2::SessionEvent::Closed(payjoin::receive::v2::SessionOutcome::FallbackBroadcasted)),
@@ -834,18 +832,14 @@ mod integration {
         /// Returns the transaction which the sender broadcasts and the state of the Receiver
         /// before they begin monitoring ([`Receiver<Monitor>`]) so that different tests can modify
         /// how the receiver is going to validate the action the sender takes.
-        async fn do_v2_to_v2<R, S>(
+        async fn do_v2_to_v2(
             services: &TestServices,
             receiver: &corepc_node::Client,
             sender: &corepc_node::Client,
-            recv_persister: &R,
-            send_persister: &S,
+            recv_persister: &InMemoryPersister<payjoin::receive::v2::SessionEvent>,
+            send_persister: &InMemoryPersister<payjoin::send::v2::SessionEvent>,
             sender_final_action: SenderFinalAction,
-        ) -> Result<(Transaction, Receiver<Monitor>), BoxError>
-        where
-            R: SessionPersister<SessionEvent = payjoin::receive::v2::SessionEvent> + Clone,
-            S: SessionPersister<SessionEvent = payjoin::send::v2::SessionEvent> + Clone,
-        {
+        ) -> Result<(Transaction, Receiver<Monitor>), BoxError> {
             let agent = services.http_agent();
             services.wait_for_services_ready().await?;
             let ohttp_keys = services.fetch_ohttp_keys().await?;
@@ -978,7 +972,7 @@ mod integration {
                 SenderFinalAction::SignAndBroadcastPayjoinProposal =>
                     extract_pj_tx(sender, checked_payjoin_proposal_psbt.clone())?,
                 SenderFinalAction::BroadcastFallbackTransaction =>
-                    replay_sender_event_log(send_persister)?.1.fallback_tx(),
+                    replay_sender_event_log(send_persister.load()?)?.1.fallback_tx(),
             };
             sender.send_raw_transaction(&broadcasted_transaction)?;
             Ok((broadcasted_transaction, monitoring_payment))
@@ -1206,7 +1200,7 @@ mod integration {
         fn handle_directory_proposal(
             receiver: &corepc_node::Client,
             proposal: Receiver<UncheckedOriginalPayload>,
-            recv_persister: &impl SessionPersister<SessionEvent = payjoin::receive::v2::SessionEvent>,
+            recv_persister: &InMemoryPersister<payjoin::receive::v2::SessionEvent>,
             custom_inputs: Option<Vec<InputPair>>,
         ) -> Result<Receiver<PayjoinProposal>, BoxError> {
             // Receive Check 1: Can Broadcast

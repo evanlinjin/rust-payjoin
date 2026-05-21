@@ -1655,7 +1655,7 @@ pub mod test {
 
     use super::*;
     use crate::output_substitution::OutputSubstitution;
-    use crate::persist::{InMemoryPersister, OptionalTransitionOutcome, SessionPersister};
+    use crate::persist::{InMemoryPersister, OptionalTransitionOutcome};
     use crate::receive::optional_parameters::Params;
     use crate::receive::v2;
     use crate::ImplementationError;

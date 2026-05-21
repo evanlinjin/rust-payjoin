@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use payjoin::persist::SessionPersister;
+use payjoin::persist::EventBuffer;
 use payjoin::receive::v2::SessionEvent as ReceiverSessionEvent;
 use payjoin::send::v2::SessionEvent as SenderSessionEvent;
 use payjoin::HpkePublicKey;
@@ -64,14 +64,11 @@ impl SenderPersister {
 
     pub fn session_id(&self) -> SessionId { self.session_id.clone() }
 }
-impl SessionPersister for SenderPersister {
-    type SessionEvent = SenderSessionEvent;
-    type InternalStorageError = crate::db::error::Error;
-
-    fn save_event(
+impl SenderPersister {
+    pub fn save_event(
         &self,
         event: SenderSessionEvent,
-    ) -> std::result::Result<(), Self::InternalStorageError> {
+    ) -> std::result::Result<(), crate::db::error::Error> {
         let conn = self.db.get_connection()?;
         let event_data = serde_json::to_string(&event).map_err(Error::Serialize)?;
 
@@ -83,9 +80,9 @@ impl SessionPersister for SenderPersister {
         Ok(())
     }
 
-    fn load(
+    pub fn load(
         &self,
-    ) -> std::result::Result<Box<dyn Iterator<Item = SenderSessionEvent>>, Self::InternalStorageError>
+    ) -> std::result::Result<Box<dyn Iterator<Item = SenderSessionEvent>>, crate::db::error::Error>
     {
         let conn = self.db.get_connection()?;
         let mut stmt = conn.prepare(
@@ -108,14 +105,30 @@ impl SessionPersister for SenderPersister {
         Ok(Box::new(events.into_iter()))
     }
 
-    fn close(&self) -> std::result::Result<(), Self::InternalStorageError> {
-        let conn = self.db.get_connection()?;
+    /// Drain a buffer of sender events into storage, committing each event
+    /// after its write succeeds.
+    pub fn drain(
+        &self,
+        buf: &mut EventBuffer<SenderSessionEvent>,
+    ) -> std::result::Result<(), crate::db::error::Error> {
+        loop {
+            let Some(event) = buf.peek().next().cloned() else {
+                return Ok(());
+            };
+            self.save_event(event)?;
+            buf.commit(1);
+        }
+    }
 
+    /// Mark this sender session as completed so its URI / reply-key may not be
+    /// reused. Distinct from `drain` because completion is a CLI-level
+    /// concern, not a library invariant.
+    pub fn close(&self) -> std::result::Result<(), crate::db::error::Error> {
+        let conn = self.db.get_connection()?;
         conn.execute(
             "UPDATE send_sessions SET completed_at = ?1 WHERE session_id = ?2",
             params![now(), *self.session_id],
         )?;
-
         Ok(())
     }
 }
@@ -143,14 +156,11 @@ impl ReceiverPersister {
     pub fn from_id(db: Arc<Database>, id: SessionId) -> Self { Self { db, session_id: id } }
 }
 
-impl SessionPersister for ReceiverPersister {
-    type SessionEvent = ReceiverSessionEvent;
-    type InternalStorageError = crate::db::error::Error;
-
-    fn save_event(
+impl ReceiverPersister {
+    pub fn save_event(
         &self,
         event: ReceiverSessionEvent,
-    ) -> std::result::Result<(), Self::InternalStorageError> {
+    ) -> std::result::Result<(), crate::db::error::Error> {
         let conn = self.db.get_connection()?;
         let event_data = serde_json::to_string(&event).map_err(Error::Serialize)?;
 
@@ -162,12 +172,10 @@ impl SessionPersister for ReceiverPersister {
         Ok(())
     }
 
-    fn load(
+    pub fn load(
         &self,
-    ) -> std::result::Result<
-        Box<dyn Iterator<Item = ReceiverSessionEvent>>,
-        Self::InternalStorageError,
-    > {
+    ) -> std::result::Result<Box<dyn Iterator<Item = ReceiverSessionEvent>>, crate::db::error::Error>
+    {
         let conn = self.db.get_connection()?;
         let mut stmt = conn.prepare(
             "SELECT event_data FROM receive_session_events WHERE session_id = ?1 ORDER BY id ASC",
@@ -189,14 +197,28 @@ impl SessionPersister for ReceiverPersister {
         Ok(Box::new(events.into_iter()))
     }
 
-    fn close(&self) -> std::result::Result<(), Self::InternalStorageError> {
-        let conn = self.db.get_connection()?;
+    /// Drain a buffer of receiver events into storage, committing each event
+    /// after its write succeeds.
+    pub fn drain(
+        &self,
+        buf: &mut EventBuffer<ReceiverSessionEvent>,
+    ) -> std::result::Result<(), crate::db::error::Error> {
+        loop {
+            let Some(event) = buf.peek().next().cloned() else {
+                return Ok(());
+            };
+            self.save_event(event)?;
+            buf.commit(1);
+        }
+    }
 
+    /// Mark this receiver session as completed.
+    pub fn close(&self) -> std::result::Result<(), crate::db::error::Error> {
+        let conn = self.db.get_connection()?;
         conn.execute(
             "UPDATE receive_sessions SET completed_at = ?1 WHERE session_id = ?2",
             params![now(), *self.session_id],
         )?;
-
         Ok(())
     }
 }
@@ -357,7 +379,6 @@ mod tests {
             SenderPersister::new(db.clone(), uri, &rk1).expect("first session should succeed");
 
         // Mark the session as completed
-        use payjoin::persist::SessionPersister;
         persister.close().expect("close should succeed");
 
         // A new session with the same URI must be rejected even after completion

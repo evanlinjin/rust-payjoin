@@ -25,7 +25,7 @@ use tracing_subscriber::{EnvFilter, FmtSubscriber};
 pub type BoxError = Box<dyn std::error::Error + 'static>;
 pub type BoxSendSyncError = Box<dyn std::error::Error + Send + Sync>;
 
-pub use payjoin::persist::{InMemoryPersister, SessionPersister};
+pub use payjoin::persist::InMemoryPersister;
 
 static INIT_TRACING: OnceCell<()> = OnceCell::new();
 
