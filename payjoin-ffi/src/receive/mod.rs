@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 pub use error::{
     AddressParseError, InputContributionError, InputPairError, JsonReply, OutputSubstitutionError,
     ProtocolError, PsbtInputError, ReceiverApiError, ReceiverBuilderError, ReceiverError,
-    SelectionError, SessionError,
+    ReceiverErrorKind, SelectionError, SessionError,
 };
 use payjoin::bitcoin::consensus::Decodable;
 use payjoin::bitcoin::psbt::Psbt;

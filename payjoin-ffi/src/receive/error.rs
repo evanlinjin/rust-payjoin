@@ -57,18 +57,45 @@ impl From<payjoin::IntoUrlError> for ReceiverError {
 /// Surface-level error returned by receiver action methods that operate on an
 /// [`crate::receive::ReceiverEventBuffer`]. Storage errors are not represented
 /// here — those surface from the caller's drain loop.
+/// Discriminator for the underlying protocol-level error inside
+/// [`ReceiverApiError`]. Mirrors the variants of [`ReceiverError`] so foreign
+/// code can match on the kind without parsing the message string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ReceiverErrorKind {
+    /// Error in underlying protocol function (BIP 77 / BIP 78).
+    Protocol,
+    /// Error arising due to the specific receiver implementation
+    /// (e.g. database, network, wallet).
+    Implementation,
+    /// Error converting a value into a URL.
+    IntoUrl,
+    /// Catch-all for unhandled error variants.
+    Unexpected,
+}
+
+impl ReceiverErrorKind {
+    fn from_receiver_error(err: &ReceiverError) -> Self {
+        match err {
+            ReceiverError::Protocol(_) => ReceiverErrorKind::Protocol,
+            ReceiverError::Implementation(_) => ReceiverErrorKind::Implementation,
+            ReceiverError::IntoUrl(_) => ReceiverErrorKind::IntoUrl,
+            ReceiverError::Unexpected => ReceiverErrorKind::Unexpected,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum ReceiverApiError {
     /// Retry the action from the same state.
-    #[error("Transient error: {msg}")]
-    Transient { msg: String },
+    #[error("Transient {kind:?} error: {msg}")]
+    Transient { kind: ReceiverErrorKind, msg: String },
     /// Session is terminally closed.
-    #[error("Fatal error: {msg}")]
-    Fatal { msg: String },
+    #[error("Fatal {kind:?} error: {msg}")]
+    Fatal { kind: ReceiverErrorKind, msg: String },
     /// Fatal error that also produced a transition to [`HasReplyableError`].
     /// The caller can use the returned state to reply to the sender.
-    #[error("Fatal error with replyable state: {msg}")]
-    FatalWithReplyableState { msg: String, state: Arc<HasReplyableError> },
+    #[error("Fatal {kind:?} error with replyable state: {msg}")]
+    FatalWithReplyableState { kind: ReceiverErrorKind, msg: String, state: Arc<HasReplyableError> },
     /// FFI-layer validation failure (e.g. bad fee rate / amount input).
     #[error("Input validation error: {0}")]
     InputValidation(FfiValidationError),
@@ -79,32 +106,68 @@ pub enum ReceiverApiError {
 
 impl ReceiverApiError {
     /// Convert from `ApiError<E>` (no error-state variant).
-    pub(crate) fn from_api_error<E: std::fmt::Display>(err: payjoin::persist::ApiError<E>) -> Self {
+    pub(crate) fn from_api_error<E>(err: payjoin::persist::ApiError<E>) -> Self
+    where
+        ReceiverError: From<E>,
+    {
         match err {
-            payjoin::persist::ApiError::Transient(e) =>
-                ReceiverApiError::Transient { msg: e.to_string() },
-            payjoin::persist::ApiError::Fatal(e) => ReceiverApiError::Fatal { msg: e.to_string() },
-            payjoin::persist::ApiError::FatalWithState(e, _) =>
-                ReceiverApiError::Fatal { msg: e.to_string() },
+            payjoin::persist::ApiError::Transient(e) => {
+                let wrapped: ReceiverError = e.into();
+                ReceiverApiError::Transient {
+                    kind: ReceiverErrorKind::from_receiver_error(&wrapped),
+                    msg: wrapped.to_string(),
+                }
+            }
+            payjoin::persist::ApiError::Fatal(e) => {
+                let wrapped: ReceiverError = e.into();
+                ReceiverApiError::Fatal {
+                    kind: ReceiverErrorKind::from_receiver_error(&wrapped),
+                    msg: wrapped.to_string(),
+                }
+            }
+            payjoin::persist::ApiError::FatalWithState(e, _) => {
+                let wrapped: ReceiverError = e.into();
+                ReceiverApiError::Fatal {
+                    kind: ReceiverErrorKind::from_receiver_error(&wrapped),
+                    msg: wrapped.to_string(),
+                }
+            }
         }
     }
 
     /// Convert from `ApiError<E, Receiver<HasReplyableError>>` (with error-state).
-    pub(crate) fn from_api_error_with_replyable_state<E: std::fmt::Display>(
+    pub(crate) fn from_api_error_with_replyable_state<E>(
         err: payjoin::persist::ApiError<
             E,
             payjoin::receive::v2::Receiver<payjoin::receive::v2::HasReplyableError>,
         >,
-    ) -> Self {
+    ) -> Self
+    where
+        ReceiverError: From<E>,
+    {
         match err {
-            payjoin::persist::ApiError::Transient(e) =>
-                ReceiverApiError::Transient { msg: e.to_string() },
-            payjoin::persist::ApiError::Fatal(e) => ReceiverApiError::Fatal { msg: e.to_string() },
-            payjoin::persist::ApiError::FatalWithState(e, state) =>
+            payjoin::persist::ApiError::Transient(e) => {
+                let wrapped: ReceiverError = e.into();
+                ReceiverApiError::Transient {
+                    kind: ReceiverErrorKind::from_receiver_error(&wrapped),
+                    msg: wrapped.to_string(),
+                }
+            }
+            payjoin::persist::ApiError::Fatal(e) => {
+                let wrapped: ReceiverError = e.into();
+                ReceiverApiError::Fatal {
+                    kind: ReceiverErrorKind::from_receiver_error(&wrapped),
+                    msg: wrapped.to_string(),
+                }
+            }
+            payjoin::persist::ApiError::FatalWithState(e, state) => {
+                let wrapped: ReceiverError = e.into();
                 ReceiverApiError::FatalWithReplyableState {
-                    msg: e.to_string(),
+                    kind: ReceiverErrorKind::from_receiver_error(&wrapped),
+                    msg: wrapped.to_string(),
                     state: Arc::new(state.into()),
-                },
+                }
+            }
         }
     }
 }
