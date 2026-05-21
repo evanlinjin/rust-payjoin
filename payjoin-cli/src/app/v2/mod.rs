@@ -548,11 +548,13 @@ impl App {
         session: SendSession,
         persister: &SenderPersister,
     ) -> Result<()> {
+        // One buffer per sender session, threaded through the chain.
+        let mut buf = EventBuffer::new();
         match session {
             SendSession::WithReplyKey(context) =>
-                self.post_original_proposal(context, persister).await?,
+                self.post_original_proposal(context, persister, &mut buf).await?,
             SendSession::PollingForProposal(context) =>
-                self.get_proposed_payjoin_psbt(context, persister).await?,
+                self.get_proposed_payjoin_psbt(context, persister, &mut buf).await?,
             SendSession::Closed(SenderSessionOutcome::Success(proposal)) => {
                 self.process_pj_response(proposal)?;
                 return Ok(());
@@ -573,24 +575,25 @@ impl App {
         &self,
         sender: Sender<WithReplyKey>,
         persister: &SenderPersister,
+        buf: &mut EventBuffer<payjoin::send::v2::SessionEvent>,
     ) -> Result<()> {
         let (req, ctx) = sender.create_v2_post_request(
             self.unwrap_relay_or_else_fetch(Some(&sender.endpoint())).await?.as_str(),
         )?;
         let response = self.post_request(req).await?;
-        let mut buf = EventBuffer::new();
         let sender = sender
-            .process_response(&response.bytes().await?, ctx, &mut buf)
+            .process_response(&response.bytes().await?, ctx, buf)
             .map_err(|e| anyhow!("process_response failed: {e:?}"))?;
-        persister.drain(&mut buf)?;
+        persister.drain(buf)?;
         println!("Posted Original PSBT...");
-        self.get_proposed_payjoin_psbt(sender, persister).await
+        self.get_proposed_payjoin_psbt(sender, persister, buf).await
     }
 
     async fn get_proposed_payjoin_psbt(
         &self,
         sender: Sender<PollingForProposal>,
         persister: &SenderPersister,
+        buf: &mut EventBuffer<payjoin::send::v2::SessionEvent>,
     ) -> Result<()> {
         let ohttp_relay = self.unwrap_relay_or_else_fetch(Some(&sender.endpoint())).await?;
         let mut session = sender.clone();
@@ -598,9 +601,8 @@ impl App {
         loop {
             let (req, ctx) = session.create_poll_request(ohttp_relay.as_str())?;
             let response = self.post_request(req).await?;
-            let mut buf = EventBuffer::new();
-            let res = session.process_response(&response.bytes().await?, ctx, &mut buf);
-            persister.drain(&mut buf)?;
+            let res = session.process_response(&response.bytes().await?, ctx, buf);
+            persister.drain(buf)?;
             match res {
                 Ok(OptionalTransitionOutcome::Progress(psbt)) => {
                     println!("Proposal received. Processing...");
@@ -625,6 +627,7 @@ impl App {
         &self,
         session: Receiver<Initialized>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<Receiver<UncheckedOriginalPayload>> {
         let ohttp_relay =
             self.unwrap_relay_or_else_fetch(Some(&session.pj_uri().extras.endpoint())).await?;
@@ -634,13 +637,12 @@ impl App {
             let (req, context) = session.create_poll_request(ohttp_relay.as_str())?;
             println!("Polling receive request...");
             let ohttp_response = self.post_request(req).await?;
-            let mut buf = EventBuffer::new();
             let state_transition = session.process_response(
                 ohttp_response.bytes().await?.to_vec().as_slice(),
                 context,
-                &mut buf,
+                buf,
             );
-            persister.drain(&mut buf)?;
+            persister.drain(buf)?;
             match state_transition {
                 Ok(OptionalTransitionOutcome::Progress(next_state)) => {
                     println!("Got a request from the sender. Responding with a Payjoin proposal.");
@@ -660,36 +662,37 @@ impl App {
         session: ReceiveSession,
         persister: &ReceiverPersister,
     ) -> Result<()> {
-        let res = {
-            match session {
-                ReceiveSession::Initialized(proposal) =>
-                    self.read_from_directory(proposal, persister).await,
-                ReceiveSession::UncheckedOriginalPayload(proposal) =>
-                    self.check_proposal(proposal, persister).await,
-                ReceiveSession::MaybeInputsOwned(proposal) =>
-                    self.check_inputs_not_owned(proposal, persister).await,
-                ReceiveSession::MaybeInputsSeen(proposal) =>
-                    self.check_no_inputs_seen_before(proposal, persister).await,
-                ReceiveSession::OutputsUnknown(proposal) =>
-                    self.identify_receiver_outputs(proposal, persister).await,
-                ReceiveSession::WantsOutputs(proposal) =>
-                    self.commit_outputs(proposal, persister).await,
-                ReceiveSession::WantsInputs(proposal) =>
-                    self.contribute_inputs(proposal, persister).await,
-                ReceiveSession::WantsFeeRange(proposal) =>
-                    self.apply_fee_range(proposal, persister).await,
-                ReceiveSession::ProvisionalProposal(proposal) =>
-                    self.finalize_proposal(proposal, persister).await,
-                ReceiveSession::PayjoinProposal(proposal) =>
-                    self.send_payjoin_proposal(proposal, persister).await,
-                ReceiveSession::HasReplyableError(error) =>
-                    self.handle_error(error, persister).await,
-                ReceiveSession::Monitor(proposal) =>
-                    self.monitor_payjoin_proposal(proposal, persister).await,
-                ReceiveSession::Closed(_) => return Err(anyhow!("Session closed")),
-            }
-        };
-        res
+        // One buffer per session. Action methods push into it; we drain
+        // through the persister at each step. The buffer is reused, not
+        // reallocated.
+        let mut buf = EventBuffer::new();
+        match session {
+            ReceiveSession::Initialized(proposal) =>
+                self.read_from_directory(proposal, persister, &mut buf).await,
+            ReceiveSession::UncheckedOriginalPayload(proposal) =>
+                self.check_proposal(proposal, persister, &mut buf).await,
+            ReceiveSession::MaybeInputsOwned(proposal) =>
+                self.check_inputs_not_owned(proposal, persister, &mut buf).await,
+            ReceiveSession::MaybeInputsSeen(proposal) =>
+                self.check_no_inputs_seen_before(proposal, persister, &mut buf).await,
+            ReceiveSession::OutputsUnknown(proposal) =>
+                self.identify_receiver_outputs(proposal, persister, &mut buf).await,
+            ReceiveSession::WantsOutputs(proposal) =>
+                self.commit_outputs(proposal, persister, &mut buf).await,
+            ReceiveSession::WantsInputs(proposal) =>
+                self.contribute_inputs(proposal, persister, &mut buf).await,
+            ReceiveSession::WantsFeeRange(proposal) =>
+                self.apply_fee_range(proposal, persister, &mut buf).await,
+            ReceiveSession::ProvisionalProposal(proposal) =>
+                self.finalize_proposal(proposal, persister, &mut buf).await,
+            ReceiveSession::PayjoinProposal(proposal) =>
+                self.send_payjoin_proposal(proposal, persister, &mut buf).await,
+            ReceiveSession::HasReplyableError(error) =>
+                self.handle_error(error, persister, &mut buf).await,
+            ReceiveSession::Monitor(proposal) =>
+                self.monitor_payjoin_proposal(proposal, persister, &mut buf).await,
+            ReceiveSession::Closed(_) => Err(anyhow!("Session closed")),
+        }
     }
 
     #[allow(clippy::incompatible_msrv)]
@@ -697,25 +700,26 @@ impl App {
         &self,
         session: Receiver<Initialized>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
         let mut interrupt = self.interrupt.clone();
         let receiver = tokio::select! {
-            res = self.long_poll_fallback(session, persister) => res,
+            res = self.long_poll_fallback(session, persister, buf) => res,
             _ = interrupt.changed() => {
                 println!("Interrupted. Call the `resume` command to resume all sessions.");
                 return Err(anyhow!("Interrupted"));
             }
         }?;
-        self.check_proposal(receiver, persister).await
+        self.check_proposal(receiver, persister, buf).await
     }
 
     async fn check_proposal(
         &self,
         proposal: Receiver<UncheckedOriginalPayload>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
         let wallet = self.wallet();
-        let mut buf = EventBuffer::new();
         let proposal = proposal
             .check_broadcast_suitability(
                 None,
@@ -724,23 +728,23 @@ impl App {
                         .can_broadcast(tx)
                         .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
                 },
-                &mut buf,
+                buf,
             )
             .map_err(|e| anyhow!("check_broadcast_suitability: {e:?}"))?;
-        persister.drain(&mut buf)?;
+        persister.drain(buf)?;
 
         println!("Fallback transaction received. Consider broadcasting this to get paid if the Payjoin fails:");
         println!("{}", serialize_hex(&proposal.extract_tx_to_schedule_broadcast()));
-        self.check_inputs_not_owned(proposal, persister).await
+        self.check_inputs_not_owned(proposal, persister, buf).await
     }
 
     async fn check_inputs_not_owned(
         &self,
         proposal: Receiver<MaybeInputsOwned>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
         let wallet = self.wallet();
-        let mut buf = EventBuffer::new();
         let proposal = proposal
             .check_inputs_not_owned(
                 &mut |input| {
@@ -748,36 +752,36 @@ impl App {
                         .is_mine(input)
                         .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
                 },
-                &mut buf,
+                buf,
             )
             .map_err(|e| anyhow!("check_inputs_not_owned: {e:?}"))?;
-        persister.drain(&mut buf)?;
-        self.check_no_inputs_seen_before(proposal, persister).await
+        persister.drain(buf)?;
+        self.check_no_inputs_seen_before(proposal, persister, buf).await
     }
 
     async fn check_no_inputs_seen_before(
         &self,
         proposal: Receiver<MaybeInputsSeen>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
-        let mut buf = EventBuffer::new();
         let proposal = proposal
             .check_no_inputs_seen_before(
                 &mut |input| Ok(self.db.insert_input_seen_before(*input)?),
-                &mut buf,
+                buf,
             )
             .map_err(|e| anyhow!("check_no_inputs_seen_before: {e:?}"))?;
-        persister.drain(&mut buf)?;
-        self.identify_receiver_outputs(proposal, persister).await
+        persister.drain(buf)?;
+        self.identify_receiver_outputs(proposal, persister, buf).await
     }
 
     async fn identify_receiver_outputs(
         &self,
         proposal: Receiver<OutputsUnknown>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
         let wallet = self.wallet();
-        let mut buf = EventBuffer::new();
         let proposal = proposal
             .identify_receiver_outputs(
                 &mut |output_script| {
@@ -785,28 +789,29 @@ impl App {
                         .is_mine(output_script)
                         .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
                 },
-                &mut buf,
+                buf,
             )
             .map_err(|e| anyhow!("identify_receiver_outputs: {e:?}"))?;
-        persister.drain(&mut buf)?;
-        self.commit_outputs(proposal, persister).await
+        persister.drain(buf)?;
+        self.commit_outputs(proposal, persister, buf).await
     }
 
     async fn commit_outputs(
         &self,
         proposal: Receiver<WantsOutputs>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
-        let mut buf = EventBuffer::new();
-        let proposal = proposal.commit_outputs(&mut buf);
-        persister.drain(&mut buf)?;
-        self.contribute_inputs(proposal, persister).await
+        let proposal = proposal.commit_outputs(buf);
+        persister.drain(buf)?;
+        self.contribute_inputs(proposal, persister, buf).await
     }
 
     async fn contribute_inputs(
         &self,
         proposal: Receiver<WantsInputs>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
         let wallet = self.wallet();
         let candidate_inputs = wallet.list_unspent()?;
@@ -818,32 +823,31 @@ impl App {
         }
 
         let selected_input = proposal.try_preserving_privacy(candidate_inputs)?;
-        let mut buf = EventBuffer::new();
-        let proposal = proposal.contribute_inputs(vec![selected_input])?.commit_inputs(&mut buf);
-        persister.drain(&mut buf)?;
-        self.apply_fee_range(proposal, persister).await
+        let proposal = proposal.contribute_inputs(vec![selected_input])?.commit_inputs(buf);
+        persister.drain(buf)?;
+        self.apply_fee_range(proposal, persister, buf).await
     }
 
     async fn apply_fee_range(
         &self,
         proposal: Receiver<WantsFeeRange>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
-        let mut buf = EventBuffer::new();
         let proposal = proposal
-            .apply_fee_range(None, self.config.max_fee_rate, &mut buf)
+            .apply_fee_range(None, self.config.max_fee_rate, buf)
             .map_err(|e| anyhow!("apply_fee_range: {e:?}"))?;
-        persister.drain(&mut buf)?;
-        self.finalize_proposal(proposal, persister).await
+        persister.drain(buf)?;
+        self.finalize_proposal(proposal, persister, buf).await
     }
 
     async fn finalize_proposal(
         &self,
         proposal: Receiver<ProvisionalProposal>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
         let wallet = self.wallet();
-        let mut buf = EventBuffer::new();
         let proposal = proposal
             .finalize_proposal(
                 |psbt| {
@@ -851,40 +855,41 @@ impl App {
                         .process_psbt(psbt)
                         .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
                 },
-                &mut buf,
+                buf,
             )
             .map_err(|e| anyhow!("finalize_proposal: {e:?}"))?;
-        persister.drain(&mut buf)?;
-        self.send_payjoin_proposal(proposal, persister).await
+        persister.drain(buf)?;
+        self.send_payjoin_proposal(proposal, persister, buf).await
     }
 
     async fn send_payjoin_proposal(
         &self,
         proposal: Receiver<PayjoinProposal>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
         let (req, ohttp_ctx) = proposal
             .create_post_request(self.unwrap_relay_or_else_fetch(None::<&str>).await?.as_str())
             .map_err(|e| anyhow!("v2 req extraction failed {}", e))?;
         let res = self.post_request(req).await?;
         let payjoin_psbt = proposal.psbt().clone();
-        let mut buf = EventBuffer::new();
         let session = proposal
-            .process_response(&res.bytes().await?, ohttp_ctx, &mut buf)
+            .process_response(&res.bytes().await?, ohttp_ctx, buf)
             .map_err(|e| anyhow!("process_response: {e:?}"))?;
-        persister.drain(&mut buf)?;
+        persister.drain(buf)?;
         println!(
             "Response successful. Watch mempool for successful Payjoin. TXID: {}",
             payjoin_psbt.extract_tx_unchecked_fee_rate().compute_txid()
         );
 
-        return self.monitor_payjoin_proposal(session, persister).await;
+        return self.monitor_payjoin_proposal(session, persister, buf).await;
     }
 
     async fn monitor_payjoin_proposal(
         &self,
         proposal: Receiver<Monitor>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
         // On a session resumption, the receiver will resume again in this state.
         let poll_interval = tokio::time::Duration::from_millis(200);
@@ -898,16 +903,15 @@ impl App {
         let result = tokio::time::timeout(timeout_duration, async {
             loop {
                 interval.tick().await;
-                let mut buf = EventBuffer::new();
                 let check_result = proposal.check_payment(
                     |txid| {
                         self.wallet()
                             .get_raw_transaction(&txid)
                             .map_err(|e| ImplementationError::from(e.into_boxed_dyn_error()))
                     },
-                    &mut buf,
+                    buf,
                 );
-                if let Err(e) = persister.drain(&mut buf) {
+                if let Err(e) = persister.drain(buf) {
                     return Err(anyhow!("drain: {e:?}"));
                 }
 
@@ -957,6 +961,7 @@ impl App {
         &self,
         session: Receiver<HasReplyableError>,
         persister: &ReceiverPersister,
+        buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
         let (err_req, err_ctx) = session
             .create_error_request(self.unwrap_relay_or_else_fetch(None::<&str>).await?.as_str())?;
@@ -971,11 +976,10 @@ impl App {
             Err(e) => return Err(anyhow!("Failed to get error response bytes: {}", e)),
         };
 
-        let mut buf = EventBuffer::new();
-        if let Err(e) = session.process_error_response(&err_bytes, err_ctx, &mut buf) {
+        if let Err(e) = session.process_error_response(&err_bytes, err_ctx, buf) {
             return Err(anyhow!("Failed to process error response: {:?}", e));
         }
-        persister.drain(&mut buf)?;
+        persister.drain(buf)?;
 
         Ok(())
     }
