@@ -54,9 +54,6 @@ impl From<payjoin::IntoUrlError> for ReceiverError {
     fn from(value: payjoin::IntoUrlError) -> Self { ReceiverError::IntoUrl(Arc::new(value.into())) }
 }
 
-/// Surface-level error returned by receiver action methods that operate on an
-/// [`crate::receive::ReceiverEventBuffer`]. Storage errors are not represented
-/// here — those surface from the caller's drain loop.
 /// Discriminator for the underlying protocol-level error inside
 /// [`ReceiverApiError`]. Mirrors the variants of [`ReceiverError`] so foreign
 /// code can match on the kind without parsing the message string.
@@ -84,6 +81,13 @@ impl ReceiverErrorKind {
     }
 }
 
+/// Surface-level error returned by receiver action methods that operate on an
+/// [`crate::receive::ReceiverEventBuffer`]. Storage errors are not represented
+/// here — those surface from the caller's drain loop.
+///
+/// Each protocol-level variant carries a [`ReceiverErrorKind`] discriminator
+/// so foreign code can match on the kind (Protocol / Implementation / IntoUrl
+/// / Unexpected) without parsing the `msg` string.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum ReceiverApiError {
     /// Retry the action from the same state.
