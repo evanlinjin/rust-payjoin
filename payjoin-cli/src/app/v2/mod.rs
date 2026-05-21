@@ -330,7 +330,13 @@ impl AppTrait for App {
                 }
                 Err(e) => {
                     tracing::error!("An error {:?} occurred while replaying receiver session", e);
-                    Self::close_failed_session(&recv_persister, &session_id, "receiver");
+                    if let Err(close_err) = recv_persister.close() {
+                        tracing::error!(
+                            "Failed to close receiver session {session_id}: {close_err:?}"
+                        );
+                    } else {
+                        tracing::error!("Closed failed receiver session: {session_id}");
+                    }
                 }
             }
         }
@@ -347,7 +353,13 @@ impl AppTrait for App {
                 }
                 Err(e) => {
                     tracing::error!("An error {:?} occurred while replaying Sender session", e);
-                    Self::close_failed_session(&sender_persister, &session_id, "sender");
+                    if let Err(close_err) = sender_persister.close() {
+                        tracing::error!(
+                            "Failed to close sender session {session_id}: {close_err:?}"
+                        );
+                    } else {
+                        tracing::error!("Closed failed sender session: {session_id}");
+                    }
                 }
             }
         }
@@ -519,30 +531,7 @@ impl AppTrait for App {
     }
 }
 
-trait SessionClose {
-    fn close(&self) -> Result<(), crate::db::error::Error>;
-}
-
-impl SessionClose for SenderPersister {
-    fn close(&self) -> Result<(), crate::db::error::Error> { SenderPersister::close(self) }
-}
-
-impl SessionClose for ReceiverPersister {
-    fn close(&self) -> Result<(), crate::db::error::Error> { ReceiverPersister::close(self) }
-}
-
 impl App {
-    fn close_failed_session<P>(persister: &P, session_id: &SessionId, role: &str)
-    where
-        P: SessionClose,
-    {
-        if let Err(close_err) = persister.close() {
-            tracing::error!("Failed to close {} session {}: {:?}", role, session_id, close_err);
-        } else {
-            tracing::error!("Closed failed {} session: {}", role, session_id);
-        }
-    }
-
     async fn process_sender_session(
         &self,
         session: SendSession,
