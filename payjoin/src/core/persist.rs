@@ -5,6 +5,22 @@
 //! means that the session's full state can be computed by "replaying" the events.
 //! Session history is therefore a recorded as an append only log of events.
 //!
+//! # Persistence shapes
+//!
+//! Three coexisting ways to drive persistence are provided:
+//!
+//! - [`SessionPersister`] / [`AsyncSessionPersister`] — the original
+//!   callback traits. A transition's `.save(&persister)` invokes the
+//!   storage callback directly.
+//! - `deconstruct()` on each transition — returns a `(PersistActions,
+//!   Outcome)` pair as plain data so callers can drive persistence
+//!   themselves. Crate-internal, used by `.save` / `.save_async`.
+//! - [`EventBuffer`] + [`Provisional`] — a sans-IO event log with
+//!   batched, two-phase persistence (`peek` + `commit`) and runtime
+//!   persist-before-expose gating for side-effect-bearing transitions.
+//!   Suitable for callers that want uniform sync/async support without
+//!   two trait variants.
+//!
 //! # Backwards and forwards compatibility
 //!
 //! If any new fields are added to events, backwards compatibility must be
@@ -22,7 +38,213 @@
 //! version of the state machine. New sessions which do contain this event will
 //! not be interpretable by the old code.
 
+use std::collections::VecDeque;
 use std::fmt;
+
+/// Caller-owned, sans-IO event buffer. Transitions push events into it;
+/// the caller's persister drains it two-phase (peek + commit).
+///
+/// Generic over the event type so receiver and sender sessions use distinct,
+/// non-interchangeable buffer types.
+///
+/// # Two-phase drain
+///
+/// The drain loop is `peek` to read pending events, write each one to storage,
+/// then `commit(n)` to drop the persisted prefix. A panic or async
+/// cancellation between writes leaves the buffer consistent with what is
+/// already on disk: the un-persisted suffix remains queued.
+///
+/// # Replay
+///
+/// After replaying a previously persisted log, construct the buffer with
+/// [`EventBuffer::after_replay`] so [`Self::committed_count`] reflects the
+/// number of events already durable.
+pub struct EventBuffer<E> {
+    pending: VecDeque<E>,
+    /// Monotonic count of events ever pushed across the buffer's lifetime.
+    /// `committed_count() == pushed_total - pending.len()`. Used by
+    /// `Provisional` to gate side-effect-bearing accessors.
+    pushed_total: u64,
+}
+
+impl<E> EventBuffer<E> {
+    /// Construct an empty buffer.
+    pub fn new() -> Self { Self { pending: VecDeque::new(), pushed_total: 0 } }
+
+    /// Construct a buffer reflecting that `replayed` events were already
+    /// persisted before this session woke up. Use after replaying a log.
+    pub fn after_replay(replayed: u64) -> Self {
+        Self { pending: VecDeque::new(), pushed_total: replayed }
+    }
+
+    /// Returns `true` if no events are queued for persistence.
+    pub fn is_empty(&self) -> bool { self.pending.is_empty() }
+
+    /// Number of events queued for persistence (not yet committed).
+    pub fn len(&self) -> usize { self.pending.len() }
+
+    /// Total events durably persisted. `Provisional::confirm` reads this.
+    pub fn committed_count(&self) -> u64 { self.pushed_total - self.pending.len() as u64 }
+
+    /// Borrow events for writing to storage. The buffer is *not* mutated
+    /// until `commit` is called.
+    pub fn peek(&self) -> impl Iterator<Item = &E> + '_ { self.pending.iter() }
+
+    /// Drop the first `n` events. Call *only* after storage commits.
+    ///
+    /// If `n` exceeds the number of queued events, the buffer is fully
+    /// drained without panicking.
+    pub fn commit(&mut self, n: usize) {
+        for _ in 0..n.min(self.pending.len()) {
+            self.pending.pop_front();
+        }
+    }
+
+    /// Crate-internal — transitions call this. Returns the seq number assigned
+    /// to the event; `Provisional` records this to know when the event is
+    /// durable.
+    ///
+    /// Currently used only by tests; receiver/sender transitions will call
+    /// this in follow-up PRs.
+    #[allow(dead_code)]
+    pub(crate) fn push(&mut self, e: E) -> u64 {
+        self.pending.push_back(e);
+        self.pushed_total += 1;
+        self.pushed_total
+    }
+}
+
+impl<E> Default for EventBuffer<E> {
+    fn default() -> Self { Self::new() }
+}
+
+/// Type alias for an [`EventBuffer`] holding receiver session events.
+pub type ReceiverEventBuffer = EventBuffer<crate::receive::v2::SessionEvent>;
+
+/// Type alias for an [`EventBuffer`] holding sender session events.
+pub type SenderEventBuffer = EventBuffer<crate::send::v2::SessionEvent>;
+
+/// Wraps a typestate that mints an externally-visible side effect (a payjoin
+/// URI, an HTTP request to a directory). The inner value is reachable only
+/// after the event that produced it is durable.
+///
+/// Created by transitions that want persist-before-expose semantics; consumed
+/// via [`Self::confirm`]. Holding a `Provisional<T>` across an `await` or
+/// across threads is fine — it's a plain value, not a borrow.
+pub struct Provisional<T> {
+    inner: T,
+    needs_committed: u64,
+}
+
+impl<T> Provisional<T> {
+    /// Crate-internal — transitions construct these.
+    ///
+    /// Currently used only by tests; receiver/sender transitions will call
+    /// this in follow-up PRs.
+    #[allow(dead_code)]
+    pub(crate) fn new(inner: T, needs_committed: u64) -> Self { Self { inner, needs_committed } }
+
+    /// Confirm once the required event is durable. On `Err`, returns `self`
+    /// so the caller can persist more and retry. Same shape as
+    /// [`std::sync::Arc::try_unwrap`].
+    pub fn confirm<E>(self, buf: &EventBuffer<E>) -> Result<T, Self> {
+        if buf.committed_count() >= self.needs_committed {
+            Ok(self.inner)
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Inspect the inner value without consuming.
+    ///
+    /// This does NOT bypass the durability gate — it borrows the inner value
+    /// behind a layer of indirection. Use sparingly: producing externally
+    /// visible side effects from a borrowed inner before [`Self::confirm`]
+    /// defeats the persist-before-expose guarantee.
+    pub fn peek_inner(&self) -> &T { &self.inner }
+}
+
+/// Persist all events queued in `buf` via the given [`SessionPersister`].
+///
+/// Drains events one at a time, committing each in the buffer immediately
+/// after its write succeeds. A panic between writes leaves the un-persisted
+/// suffix queued; storage and buffer remain consistent.
+///
+/// Requires `Event: Clone` so each event can be moved into
+/// [`SessionPersister::save_event`] while remaining in the buffer until the
+/// write returns successfully.
+pub fn save_buffer<P>(
+    persister: &P,
+    buf: &mut EventBuffer<P::SessionEvent>,
+) -> Result<(), P::InternalStorageError>
+where
+    P: SessionPersister,
+    P::SessionEvent: Clone,
+{
+    loop {
+        let Some(event) = buf.peek().next().cloned() else {
+            return Ok(());
+        };
+        persister.save_event(event)?;
+        buf.commit(1);
+    }
+}
+
+/// Persist all queued events, then unlock and return the [`Provisional`]'s
+/// inner value.
+///
+/// After [`save_buffer`] succeeds the gate event is durable, so `confirm` is
+/// structurally unreachable on the error path.
+pub fn save_buffer_and_confirm<P, T>(
+    persister: &P,
+    buf: &mut EventBuffer<P::SessionEvent>,
+    provisional: Provisional<T>,
+) -> Result<T, P::InternalStorageError>
+where
+    P: SessionPersister,
+    P::SessionEvent: Clone,
+{
+    save_buffer(persister, buf)?;
+    Ok(provisional
+        .confirm(buf)
+        .unwrap_or_else(|_| unreachable!("save_buffer committed all events")))
+}
+
+/// Async counterpart to [`save_buffer`], for use with
+/// [`AsyncSessionPersister`].
+pub async fn save_buffer_async<P>(
+    persister: &P,
+    buf: &mut EventBuffer<P::SessionEvent>,
+) -> Result<(), P::InternalStorageError>
+where
+    P: AsyncSessionPersister,
+    P::SessionEvent: Clone,
+{
+    loop {
+        let Some(event) = buf.peek().next().cloned() else {
+            return Ok(());
+        };
+        persister.save_event(event).await?;
+        buf.commit(1);
+    }
+}
+
+/// Async counterpart to [`save_buffer_and_confirm`], for use with
+/// [`AsyncSessionPersister`].
+pub async fn save_buffer_and_confirm_async<P, T>(
+    persister: &P,
+    buf: &mut EventBuffer<P::SessionEvent>,
+    provisional: Provisional<T>,
+) -> Result<T, P::InternalStorageError>
+where
+    P: AsyncSessionPersister,
+    P::SessionEvent: Clone,
+{
+    save_buffer_async(persister, buf).await?;
+    Ok(provisional
+        .confirm(buf)
+        .unwrap_or_else(|_| unreachable!("save_buffer_async committed all events")))
+}
 
 /// Representation of the actions that the persister should take, if any.
 pub(crate) enum PersistActions<Event> {
@@ -1446,5 +1668,163 @@ mod tests {
         );
         assert!(transient_error.storage_error_ref().is_none());
         assert!(transient_error.api_error_ref().is_some());
+    }
+
+    #[test]
+    fn event_buffer_push_increments_committed_only_after_commit() {
+        let mut buf: EventBuffer<&'static str> = EventBuffer::new();
+        assert_eq!(buf.committed_count(), 0);
+        assert!(buf.is_empty());
+
+        let seq = buf.push("a");
+        assert_eq!(seq, 1);
+        assert_eq!(buf.len(), 1);
+        assert_eq!(buf.committed_count(), 0, "push alone does not commit");
+
+        buf.commit(1);
+        assert_eq!(buf.committed_count(), 1);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn event_buffer_peek_is_non_destructive() {
+        let mut buf: EventBuffer<&'static str> = EventBuffer::new();
+        buf.push("a");
+        buf.push("b");
+
+        let first: Vec<&&'static str> = buf.peek().collect();
+        let second: Vec<&&'static str> = buf.peek().collect();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 2);
+        assert_eq!(buf.len(), 2, "peek does not mutate");
+    }
+
+    #[test]
+    fn event_buffer_commit_past_end_is_noop() {
+        let mut buf: EventBuffer<&'static str> = EventBuffer::new();
+        buf.push("a");
+        buf.push("b");
+
+        buf.commit(100);
+        assert!(buf.is_empty());
+        assert_eq!(buf.committed_count(), 2);
+
+        // Committing again on an empty buffer is also a no-op, not a panic.
+        buf.commit(5);
+        assert!(buf.is_empty());
+        assert_eq!(buf.committed_count(), 2);
+    }
+
+    #[test]
+    fn provisional_confirm_before_and_after_commit() {
+        let mut buf: EventBuffer<&'static str> = EventBuffer::new();
+        let seq = buf.push("create");
+        let provisional = Provisional::new(42_u32, seq);
+
+        // Before commit: returns self.
+        let provisional = match provisional.confirm(&buf) {
+            Ok(_) => panic!("confirmed before commit"),
+            Err(p) => p,
+        };
+
+        buf.commit(1);
+
+        // After commit: returns inner.
+        let inner =
+            provisional.confirm(&buf).unwrap_or_else(|_| panic!("not confirmed after commit"));
+        assert_eq!(inner, 42);
+    }
+
+    #[test]
+    fn provisional_retry_loop_pattern() {
+        let mut buf: EventBuffer<&'static str> = EventBuffer::new();
+        let seq = buf.push("create");
+        let mut p = Provisional::new(42_u32, seq);
+
+        // Loop until confirm succeeds, persisting one event per iteration.
+        let inner = loop {
+            match p.confirm(&buf) {
+                Ok(v) => break v,
+                Err(returned) => {
+                    p = returned;
+                    buf.commit(1);
+                }
+            }
+        };
+        assert_eq!(inner, 42);
+    }
+
+    #[test]
+    fn after_replay_sets_committed_count() {
+        let buf: EventBuffer<&'static str> = EventBuffer::after_replay(5);
+        assert_eq!(buf.committed_count(), 5);
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn after_replay_then_push_continues_sequence() {
+        let mut buf: EventBuffer<&'static str> = EventBuffer::after_replay(3);
+        let seq = buf.push("next");
+        assert_eq!(seq, 4, "seq numbers continue from replayed count");
+        assert_eq!(buf.committed_count(), 3);
+
+        buf.commit(1);
+        assert_eq!(buf.committed_count(), 4);
+    }
+
+    #[test]
+    fn provisional_peek_inner_does_not_consume() {
+        let mut buf: EventBuffer<&'static str> = EventBuffer::new();
+        let seq = buf.push("create");
+        let p = Provisional::new("hidden".to_string(), seq);
+
+        assert_eq!(p.peek_inner(), "hidden");
+        assert_eq!(p.peek_inner(), "hidden");
+    }
+
+    #[tokio::test]
+    async fn save_buffer_drains_into_session_persister() {
+        let persister: InMemoryPersister<InMemoryTestEvent> = InMemoryPersister::default();
+        let mut buf: EventBuffer<InMemoryTestEvent> = EventBuffer::new();
+        let seq_a = buf.push(InMemoryTestEvent("a".to_string()));
+        let seq_b = buf.push(InMemoryTestEvent("b".to_string()));
+        assert_eq!(seq_a, 1);
+        assert_eq!(seq_b, 2);
+
+        save_buffer(&persister, &mut buf).expect("save_buffer succeeds");
+        assert!(buf.is_empty());
+        assert_eq!(buf.committed_count(), 2);
+
+        let events: Vec<InMemoryTestEvent> = persister.load().expect("load").collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].0, "a");
+        assert_eq!(events[1].0, "b");
+
+        // Sync helper variant.
+        let mut buf2: EventBuffer<InMemoryTestEvent> = EventBuffer::new();
+        let seq = buf2.push(InMemoryTestEvent("gated".to_string()));
+        let provisional = Provisional::new("uri".to_string(), seq);
+        let uri = save_buffer_and_confirm(&persister, &mut buf2, provisional)
+            .expect("save_buffer_and_confirm succeeds");
+        assert_eq!(uri, "uri");
+        assert!(buf2.is_empty());
+
+        // Async equivalents.
+        let async_persister: InMemoryAsyncPersister<InMemoryTestEvent> =
+            InMemoryAsyncPersister::default();
+        let mut buf3: EventBuffer<InMemoryTestEvent> = EventBuffer::new();
+        buf3.push(InMemoryTestEvent("x".to_string()));
+        let seq = buf3.push(InMemoryTestEvent("y".to_string()));
+        let provisional = Provisional::new(7_u32, seq);
+        let inner = save_buffer_and_confirm_async(&async_persister, &mut buf3, provisional)
+            .await
+            .expect("save_buffer_and_confirm_async succeeds");
+        assert_eq!(inner, 7);
+        assert!(buf3.is_empty());
+        let async_events: Vec<InMemoryTestEvent> =
+            async_persister.load().await.expect("load async").collect();
+        assert_eq!(async_events.len(), 2);
+        assert_eq!(async_events[1].0, "y");
     }
 }
