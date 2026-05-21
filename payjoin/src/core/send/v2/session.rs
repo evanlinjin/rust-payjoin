@@ -303,6 +303,8 @@ mod tests {
     #[tokio::test]
     async fn test_sender_session_history_with_expired_session() {
         let psbt = PARSED_ORIGINAL_PSBT.clone();
+        let send_persister: InMemoryPersister<SessionEvent> = InMemoryPersister::default();
+        let mut buf = crate::persist::EventBuffer::new();
         let sender = SenderBuilder::new(
             psbt.clone(),
             Uri::try_from(PJ_URI)
@@ -311,10 +313,9 @@ mod tests {
                 .check_pj_supported()
                 .expect("Payjoin to be supported"),
         )
-        .build_recommended(FeeRate::BROADCAST_MIN)
-        .unwrap()
-        .save(&InMemoryPersister::default())
+        .build_recommended(FeeRate::BROADCAST_MIN, &mut buf)
         .unwrap();
+        send_persister.drain(&mut buf).unwrap();
         let test = SessionHistoryTest {
             events: vec![SessionEvent::Created(Box::new(sender.session_context.clone()))],
             expected_session_history: SessionHistoryExpectedOutcome {
@@ -337,6 +338,8 @@ mod tests {
     #[tokio::test]
     async fn test_sender_session_history_with_reply_key_event() {
         let psbt = PARSED_ORIGINAL_PSBT.clone();
+        let send_persister: InMemoryPersister<SessionEvent> = InMemoryPersister::default();
+        let mut buf = crate::persist::EventBuffer::new();
         let mut sender = SenderBuilder::new(
             psbt.clone(),
             Uri::try_from(PJ_URI)
@@ -345,10 +348,9 @@ mod tests {
                 .check_pj_supported()
                 .expect("Payjoin to be supported"),
         )
-        .build_recommended(FeeRate::BROADCAST_MIN)
-        .unwrap()
-        .save(&InMemoryPersister::default())
+        .build_recommended(FeeRate::BROADCAST_MIN, &mut buf)
         .unwrap();
+        send_persister.drain(&mut buf).unwrap();
         sender.session_context.pj_param.expiration =
             Time::from_now(std::time::Duration::from_secs(60)).unwrap();
         let test = SessionHistoryTest {
@@ -373,6 +375,8 @@ mod tests {
     #[test]
     fn status_is_completed_for_closed_success() {
         let psbt = PARSED_ORIGINAL_PSBT.clone();
+        let send_persister: InMemoryPersister<SessionEvent> = InMemoryPersister::default();
+        let mut buf = crate::persist::EventBuffer::new();
         let sender = SenderBuilder::new(
             psbt.clone(),
             Uri::try_from(PJ_URI)
@@ -381,10 +385,9 @@ mod tests {
                 .check_pj_supported()
                 .expect("Payjoin to be supported"),
         )
-        .build_recommended(FeeRate::BROADCAST_MIN)
-        .unwrap()
-        .save(&InMemoryPersister::default())
+        .build_recommended(FeeRate::BROADCAST_MIN, &mut buf)
         .unwrap();
+        send_persister.drain(&mut buf).unwrap();
 
         let reply_key = HpkeKeyPair::gen_keypair();
         let endpoint = Url::parse(&sender.endpoint()).expect("Could not parse url");

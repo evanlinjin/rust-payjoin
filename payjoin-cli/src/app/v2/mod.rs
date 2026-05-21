@@ -241,10 +241,11 @@ impl AppTrait for App {
                         let persister =
                             SenderPersister::new(self.db.clone(), bip21, receiver_pubkey)?;
                         let psbt = self.create_original_psbt(&address, amount, fee_rate)?;
+                        let mut buf = EventBuffer::new();
                         let sender =
                             SenderBuilder::from_parts(psbt, pj_param, &address, Some(amount))
-                                .build_recommended(fee_rate)?
-                                .save(&persister)?;
+                                .build_recommended(fee_rate, &mut buf)?;
+                        persister.drain(&mut buf)?;
 
                         (SendSession::WithReplyKey(sender), persister)
                     }

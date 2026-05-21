@@ -45,10 +45,7 @@ use crate::core::Url;
 use crate::error::{InternalReplayError, ReplayError};
 use crate::hpke::{decrypt_message_b, encrypt_message_a, HpkeSecretKey};
 use crate::ohttp::{ohttp_encapsulate, process_get_res, process_post_res};
-use crate::persist::{
-    MaybeFatalTransition, MaybeSuccessTransitionWithNoResults, NextStateTransition,
-    TerminalTransition,
-};
+use crate::persist::{ApiError, EventBuffer, OptionalTransitionOutcome};
 use crate::uri::v2::PjParam;
 use crate::uri::ShortId;
 use crate::{HpkeKeyPair, IntoUrl, PjUri, Request};
@@ -117,10 +114,11 @@ impl SenderBuilder {
     pub fn build_recommended(
         self,
         min_fee_rate: FeeRate,
-    ) -> Result<NextStateTransition<SessionEvent, Sender<WithReplyKey>>, BuildSenderError> {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Sender<WithReplyKey>, BuildSenderError> {
         let psbt_ctx =
             self.psbt_ctx_builder.build_recommended(min_fee_rate, self.output_substitution)?;
-        Ok(Self::v2_transition_from_psbt_ctx(self.pj_param, psbt_ctx))
+        Ok(Self::v2_sender_from_psbt_ctx(self.pj_param, psbt_ctx, buf))
     }
 
     /// Offer the receiver contribution to pay for his input.
@@ -142,7 +140,8 @@ impl SenderBuilder {
         change_index: Option<usize>,
         min_fee_rate: FeeRate,
         clamp_fee_contribution: bool,
-    ) -> Result<NextStateTransition<SessionEvent, Sender<WithReplyKey>>, BuildSenderError> {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Sender<WithReplyKey>, BuildSenderError> {
         let psbt_ctx = self.psbt_ctx_builder.build_with_additional_fee(
             max_fee_contribution,
             change_index,
@@ -150,7 +149,7 @@ impl SenderBuilder {
             clamp_fee_contribution,
             self.output_substitution,
         )?;
-        Ok(Self::v2_transition_from_psbt_ctx(self.pj_param, psbt_ctx))
+        Ok(Self::v2_sender_from_psbt_ctx(self.pj_param, psbt_ctx, buf))
     }
 
     /// Perform Payjoin without incentivizing the payee to cooperate.
@@ -160,24 +159,23 @@ impl SenderBuilder {
     pub fn build_non_incentivizing(
         self,
         min_fee_rate: FeeRate,
-    ) -> Result<NextStateTransition<SessionEvent, Sender<WithReplyKey>>, BuildSenderError> {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Sender<WithReplyKey>, BuildSenderError> {
         let psbt_ctx = self
             .psbt_ctx_builder
             .build_non_incentivizing(min_fee_rate, self.output_substitution)?;
-        Ok(Self::v2_transition_from_psbt_ctx(self.pj_param, psbt_ctx))
+        Ok(Self::v2_sender_from_psbt_ctx(self.pj_param, psbt_ctx, buf))
     }
 
-    /// Helper function that takes a V1 sender build result and wraps it in a V2 Sender,
-    /// returning the appropriate state transition.
-    fn v2_transition_from_psbt_ctx(
+    /// Helper that wraps a V1 build result in a V2 Sender, pushing the Created event into `buf`.
+    fn v2_sender_from_psbt_ctx(
         pj_param: PjParam,
         psbt_ctx: PsbtContext,
-    ) -> NextStateTransition<SessionEvent, Sender<WithReplyKey>> {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Sender<WithReplyKey> {
         let sender = Sender::new(pj_param, psbt_ctx);
-        NextStateTransition::success(
-            SessionEvent::Created(Box::new(sender.session_context.clone())),
-            sender,
-        )
+        buf.push(SessionEvent::Created(Box::new(sender.session_context.clone())));
+        sender
     }
 }
 
@@ -253,10 +251,11 @@ impl<S: State> Sender<S> {
     /// should be broadcast to complete the payment without Payjoin.
     ///
     /// This is a terminal transition — the session cannot be used after cancellation.
-    pub fn cancel(self) -> TerminalTransition<SessionEvent, bitcoin::Transaction> {
+    pub fn cancel(self, buf: &mut EventBuffer<SessionEvent>) -> bitcoin::Transaction {
         let fallback =
             self.session_context.psbt_ctx.original_psbt.clone().extract_tx_unchecked_fee_rate();
-        TerminalTransition::new(SessionEvent::Closed(SessionOutcome::Cancel), fallback)
+        buf.push(SessionEvent::Closed(SessionOutcome::Cancel));
+        fallback
     }
 }
 
@@ -360,24 +359,26 @@ impl Sender<WithReplyKey> {
         self,
         response: &[u8],
         post_ctx: ClientResponse,
-    ) -> MaybeFatalTransition<SessionEvent, Sender<PollingForProposal>, EncapsulationError> {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Sender<PollingForProposal>, ApiError<EncapsulationError>> {
         match process_post_res(response, post_ctx) {
             Ok(()) => {}
             Err(e) =>
                 if e.is_fatal() {
-                    return MaybeFatalTransition::fatal(
-                        SessionEvent::Closed(SessionOutcome::Failure),
+                    buf.push(SessionEvent::Closed(SessionOutcome::Failure));
+                    return Err(ApiError::Fatal(
                         InternalEncapsulationError::DirectoryResponse(e).into(),
-                    );
+                    ));
                 } else {
-                    return MaybeFatalTransition::transient(
+                    return Err(ApiError::Transient(
                         InternalEncapsulationError::DirectoryResponse(e).into(),
-                    );
+                    ));
                 },
         }
 
         let sender = Sender { state: PollingForProposal, session_context: self.session_context };
-        MaybeFatalTransition::success(SessionEvent::PostedOriginalPsbt(), sender)
+        buf.push(SessionEvent::PostedOriginalPsbt());
+        Ok(sender)
     }
 
     pub(crate) fn apply_polling_for_proposal(self) -> SendSession {
@@ -488,25 +489,22 @@ impl Sender<PollingForProposal> {
         self,
         response: &[u8],
         ohttp_ctx: ohttp::ClientResponse,
-    ) -> MaybeSuccessTransitionWithNoResults<
-        SessionEvent,
-        Psbt,
-        Sender<PollingForProposal>,
-        ResponseError,
-    > {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<OptionalTransitionOutcome<Psbt, Sender<PollingForProposal>>, ApiError<ResponseError>>
+    {
         let body = match process_get_res(response, ohttp_ctx) {
             Ok(Some(body)) => body,
-            Ok(None) => return MaybeSuccessTransitionWithNoResults::no_results(self.clone()),
+            Ok(None) => return Ok(OptionalTransitionOutcome::Stasis(self.clone())),
             Err(e) =>
                 if e.is_fatal() {
-                    return MaybeSuccessTransitionWithNoResults::fatal(
-                        SessionEvent::Closed(SessionOutcome::Failure),
+                    buf.push(SessionEvent::Closed(SessionOutcome::Failure));
+                    return Err(ApiError::Fatal(
                         InternalEncapsulationError::DirectoryResponse(e).into(),
-                    );
+                    ));
                 } else {
-                    return MaybeSuccessTransitionWithNoResults::transient(
+                    return Err(ApiError::Transient(
                         InternalEncapsulationError::DirectoryResponse(e).into(),
-                    );
+                    ));
                 },
         };
 
@@ -516,42 +514,35 @@ impl Sender<PollingForProposal> {
             &self.session_context.reply_key,
         ) {
             Ok(body) => body,
-            Err(e) =>
-                return MaybeSuccessTransitionWithNoResults::fatal(
-                    SessionEvent::Closed(SessionOutcome::Failure),
-                    InternalEncapsulationError::Hpke(e).into(),
-                ),
+            Err(e) => {
+                buf.push(SessionEvent::Closed(SessionOutcome::Failure));
+                return Err(ApiError::Fatal(InternalEncapsulationError::Hpke(e).into()));
+            }
         };
 
         if let Ok(resp_err) = ResponseError::from_slice(&body) {
-            return MaybeSuccessTransitionWithNoResults::fatal(
-                SessionEvent::Closed(SessionOutcome::Failure),
-                resp_err,
-            );
+            buf.push(SessionEvent::Closed(SessionOutcome::Failure));
+            return Err(ApiError::Fatal(resp_err));
         }
 
         let proposal = match Psbt::deserialize(&body) {
             Ok(proposal) => proposal,
-            Err(e) =>
-                return MaybeSuccessTransitionWithNoResults::fatal(
-                    SessionEvent::Closed(SessionOutcome::Failure),
-                    InternalProposalError::Psbt(e).into(),
-                ),
+            Err(e) => {
+                buf.push(SessionEvent::Closed(SessionOutcome::Failure));
+                return Err(ApiError::Fatal(InternalProposalError::Psbt(e).into()));
+            }
         };
         let processed_proposal =
             match self.session_context.psbt_ctx.clone().process_proposal(proposal) {
                 Ok(processed_proposal) => processed_proposal,
-                Err(e) =>
-                    return MaybeSuccessTransitionWithNoResults::fatal(
-                        SessionEvent::Closed(SessionOutcome::Failure),
-                        e.into(),
-                    ),
+                Err(e) => {
+                    buf.push(SessionEvent::Closed(SessionOutcome::Failure));
+                    return Err(ApiError::Fatal(e.into()));
+                }
             };
 
-        MaybeSuccessTransitionWithNoResults::success(
-            processed_proposal.clone(),
-            SessionEvent::Closed(SessionOutcome::Success(processed_proposal)),
-        )
+        buf.push(SessionEvent::Closed(SessionOutcome::Success(processed_proposal.clone())));
+        Ok(OptionalTransitionOutcome::Progress(processed_proposal))
     }
 }
 
@@ -666,11 +657,12 @@ mod test {
             .build(&mut recv_buf);
         recv_persister.drain(&mut recv_buf).expect("drain");
         let pj_uri = provisional.confirm(&recv_buf).expect("Created event durable").pj_uri();
+        let send_persister: InMemoryPersister<SessionEvent> = InMemoryPersister::default();
+        let mut send_buf = EventBuffer::new();
         let req_ctx = SenderBuilder::new(PARSED_ORIGINAL_PSBT.clone(), pj_uri.clone())
-            .build_recommended(FeeRate::BROADCAST_MIN)
-            .expect("build on test vector should succeed")
-            .save(&InMemoryPersister::default())
-            .expect("sender should succeed");
+            .build_recommended(FeeRate::BROADCAST_MIN, &mut send_buf)
+            .expect("build on test vector should succeed");
+        send_persister.drain(&mut send_buf).expect("drain");
         // v2 senders may always override the receiver's `pjos` parameter to enable output
         // substitution
         assert_eq!(
@@ -687,31 +679,37 @@ mod test {
         assert_eq!(fee_contribution.vout, 0);
         assert_eq!(req_ctx.session_context.psbt_ctx.min_fee_rate, FeeRate::from_sat_per_kwu(250));
         // ensure that the other builder methods also enable output substitution
+        let mut send_buf = EventBuffer::new();
         let req_ctx = SenderBuilder::new(PARSED_ORIGINAL_PSBT.clone(), pj_uri.clone())
-            .build_non_incentivizing(FeeRate::BROADCAST_MIN)
-            .expect("build on test vector should succeed")
-            .save(&InMemoryPersister::default())
-            .expect("sender should succeed");
+            .build_non_incentivizing(FeeRate::BROADCAST_MIN, &mut send_buf)
+            .expect("build on test vector should succeed");
+        send_persister.drain(&mut send_buf).expect("drain");
         assert_eq!(
             req_ctx.session_context.psbt_ctx.output_substitution,
             OutputSubstitution::Enabled
         );
+        let mut send_buf = EventBuffer::new();
         let req_ctx = SenderBuilder::new(PARSED_ORIGINAL_PSBT.clone(), pj_uri.clone())
-            .build_with_additional_fee(Amount::ZERO, Some(0), FeeRate::BROADCAST_MIN, false)
-            .expect("build on test vector should succeed")
-            .save(&InMemoryPersister::default())
-            .expect("sender should succeed");
+            .build_with_additional_fee(
+                Amount::ZERO,
+                Some(0),
+                FeeRate::BROADCAST_MIN,
+                false,
+                &mut send_buf,
+            )
+            .expect("build on test vector should succeed");
+        send_persister.drain(&mut send_buf).expect("drain");
         assert_eq!(
             req_ctx.session_context.psbt_ctx.output_substitution,
             OutputSubstitution::Enabled
         );
         // ensure that a v2 sender may still disable output substitution if they prefer.
+        let mut send_buf = EventBuffer::new();
         let req_ctx = SenderBuilder::new(PARSED_ORIGINAL_PSBT.clone(), pj_uri)
             .always_disable_output_substitution()
-            .build_recommended(FeeRate::BROADCAST_MIN)
-            .expect("build on test vector should succeed")
-            .save(&InMemoryPersister::default())
-            .expect("sender should succeed");
+            .build_recommended(FeeRate::BROADCAST_MIN, &mut send_buf)
+            .expect("build on test vector should succeed");
+        send_persister.drain(&mut send_buf).expect("drain");
         assert_eq!(
             req_ctx.session_context.psbt_ctx.output_substitution,
             OutputSubstitution::Disabled
@@ -728,11 +726,11 @@ mod test {
         macro_rules! do_cancel_test {
             ($state:expr) => {{
                 let persister = InMemoryPersister::<SessionEvent>::default();
+                let mut buf = EventBuffer::new();
                 let fallback =
                     Sender { state: $state, session_context: sender.session_context.clone() }
-                        .cancel()
-                        .save(&persister)
-                        .expect("save should succeed");
+                        .cancel(&mut buf);
+                persister.drain(&mut buf).expect("drain should succeed");
                 assert_eq!(fallback, expected_tx, "cancel from {}", stringify!($state));
             }};
         }

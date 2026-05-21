@@ -316,9 +316,10 @@ mod integration {
                 // Inside the Sender:
                 let psbt = build_original_psbt(&sender, &expired_receiver.pj_uri())?;
                 // Test that an expired pj_url errors
+                let mut send_buf = EventBuffer::new();
                 let expired_req_ctx = SenderBuilder::new(psbt, expired_receiver.pj_uri())
-                    .build_non_incentivizing(FeeRate::BROADCAST_MIN)?
-                    .save(&send_persister)?;
+                    .build_non_incentivizing(FeeRate::BROADCAST_MIN, &mut send_buf)?;
+                send_persister.drain(&mut send_buf)?;
 
                 match expired_req_ctx.create_v2_post_request(services.ohttp_relay_url().as_str()) {
                     // Internal error types are private, so check against a string
@@ -397,18 +398,21 @@ mod integration {
                     .check_pj_supported()
                     .map_err(|e| e.to_string())?;
                 let psbt = build_sweep_psbt(&sender, &pj_uri)?;
+                let mut send_buf = EventBuffer::new();
                 let req_ctx = SenderBuilder::new(psbt, pj_uri)
-                    .build_recommended(FeeRate::BROADCAST_MIN)?
-                    .save(&sender_persister)?;
+                    .build_recommended(FeeRate::BROADCAST_MIN, &mut send_buf)?;
+                sender_persister.drain(&mut send_buf)?;
                 let (Request { url, body, content_type, .. }, send_ctx) =
                     req_ctx.create_v2_post_request(services.ohttp_relay_url().as_str())?;
                 let response =
                     agent.post(url).header("Content-Type", content_type).body(body).send().await?;
                 tracing::info!("Response: {:#?}", &response);
                 assert!(response.status().is_success(), "error response: {}", response.status());
+                let mut send_buf = EventBuffer::new();
                 let req_ctx = req_ctx
-                    .process_response(&response.bytes().await?, send_ctx)
-                    .save(&sender_persister)?;
+                    .process_response(&response.bytes().await?, send_ctx, &mut send_buf)
+                    .map_err(|e| format!("{e:?}"))?;
+                sender_persister.drain(&mut send_buf)?;
 
                 // POST Original PSBT
 
@@ -500,12 +504,17 @@ mod integration {
                     .send()
                     .await?;
                 assert!(response.status().is_success(), "error response: {}", response.status());
+                let mut send_buf = EventBuffer::new();
                 let reply_error = req_ctx
-                    .process_response(&response.bytes().await?, ctx)
-                    .save(&sender_persister)
+                    .process_response(&response.bytes().await?, ctx, &mut send_buf)
                     .expect_err("Should be a fatal error");
+                sender_persister.drain(&mut send_buf)?;
 
-                let api_error = reply_error.api_error().expect("expecting error from API");
+                let api_error = match reply_error {
+                    payjoin::persist::ApiError::Fatal(e)
+                    | payjoin::persist::ApiError::Transient(e)
+                    | payjoin::persist::ApiError::FatalWithState(e, _) => e,
+                };
                 match api_error {
                     ResponseError::WellKnown(well_known_error) => {
                         assert_eq!(
@@ -886,18 +895,21 @@ mod integration {
                 .check_pj_supported()
                 .map_err(|e| e.to_string())?;
             let psbt = build_sweep_psbt(sender, &pj_uri)?;
+            let mut send_buf = EventBuffer::new();
             let req_ctx = SenderBuilder::new(psbt, pj_uri)
-                .build_recommended(FeeRate::BROADCAST_MIN)?
-                .save(send_persister)?;
+                .build_recommended(FeeRate::BROADCAST_MIN, &mut send_buf)?;
+            send_persister.drain(&mut send_buf)?;
             let (Request { url, body, content_type, .. }, send_ctx) =
                 req_ctx.create_v2_post_request(services.ohttp_relay_url().as_str())?;
             let response =
                 agent.post(url).header("Content-Type", content_type).body(body).send().await?;
             tracing::info!("Response: {:#?}", &response);
             assert!(response.status().is_success(), "error response: {}", response.status());
+            let mut send_buf = EventBuffer::new();
             let send_ctx = req_ctx
-                .process_response(&response.bytes().await?, send_ctx)
-                .save(send_persister)?;
+                .process_response(&response.bytes().await?, send_ctx, &mut send_buf)
+                .map_err(|e| format!("{e:?}"))?;
+            send_persister.drain(&mut send_buf)?;
             // POST Original PSBT
 
             // **********************
@@ -949,10 +961,11 @@ mod integration {
             let response =
                 agent.post(url).header("Content-Type", content_type).body(body).send().await?;
             tracing::info!("Response: {:#?}", &response);
+            let mut send_buf = EventBuffer::new();
             let response = send_ctx
-                .process_response(&response.bytes().await?, ohttp_ctx)
-                .save(send_persister)
+                .process_response(&response.bytes().await?, ohttp_ctx, &mut send_buf)
                 .expect("psbt should exist");
+            send_persister.drain(&mut send_buf)?;
 
             let checked_payjoin_proposal_psbt =
                 if let OptionalTransitionOutcome::Progress(psbt) = response {
