@@ -263,7 +263,8 @@ impl SenderSessionHistory {
 // Sender typestates
 // =============================================================================
 
-/// Helper macro to add a `cancel` method to each sender typestate.
+/// Helper macro to add `cancel` plus session-metadata accessors to each
+/// sender typestate.
 macro_rules! impl_cancel_for_sender {
     ($ty:ident) => {
         #[uniffi::export]
@@ -283,6 +284,12 @@ macro_rules! impl_cancel_for_sender {
                 let tx = self.0.clone().cancel(&mut *g);
                 payjoin::bitcoin::consensus::serialize(&tx)
             }
+
+            /// The endpoint in the Payjoin URI (the directory URL).
+            pub fn endpoint(&self) -> String { self.0.endpoint() }
+
+            /// Session expiration as a Unix timestamp (seconds since epoch).
+            pub fn expiration_unix_secs(&self) -> u64 { self.0.expiration_unix_secs() }
         }
     };
 }
@@ -543,8 +550,10 @@ impl_cancel_for_sender!(PollingForProposal);
 
 #[derive(uniffi::Enum)]
 pub enum PollingForProposalTransitionOutcome {
-    /// Got the receiver's signed PSBT. Sign and broadcast it.
-    Progress { psbt_base64: String },
+    /// Got the receiver's signed PSBT, staged behind a [`ProvisionalPsbt`].
+    /// The sender must drain the buffer (the `Closed(Success)` event has been
+    /// pushed) and then `confirm(buf)` before signing and broadcasting.
+    Progress { inner: Arc<ProvisionalPsbt> },
     /// No response yet; resume polling from the current state.
     Stasis { inner: Arc<PollingForProposal> },
 }
@@ -552,22 +561,63 @@ pub enum PollingForProposalTransitionOutcome {
 impl
     From<
         payjoin::persist::OptionalTransitionOutcome<
-            payjoin::bitcoin::Psbt,
+            payjoin::persist::Provisional<payjoin::bitcoin::Psbt>,
             payjoin::send::v2::Sender<payjoin::send::v2::PollingForProposal>,
         >,
     > for PollingForProposalTransitionOutcome
 {
     fn from(
         value: payjoin::persist::OptionalTransitionOutcome<
-            payjoin::bitcoin::Psbt,
+            payjoin::persist::Provisional<payjoin::bitcoin::Psbt>,
             payjoin::send::v2::Sender<payjoin::send::v2::PollingForProposal>,
         >,
     ) -> Self {
         match value {
-            payjoin::persist::OptionalTransitionOutcome::Progress(psbt) =>
-                Self::Progress { psbt_base64: psbt.to_string() },
+            payjoin::persist::OptionalTransitionOutcome::Progress(provisional) => Self::Progress {
+                inner: Arc::new(ProvisionalPsbt { inner: Mutex::new(Some(provisional)) }),
+            },
             payjoin::persist::OptionalTransitionOutcome::Stasis(state) =>
                 Self::Stasis { inner: Arc::new(state.into()) },
+        }
+    }
+}
+
+/// A finalized Payjoin PSBT staged for persistence by
+/// [`PollingForProposal::process_response`].
+///
+/// The sender cannot sign or broadcast the proposal until the producing
+/// `Closed(Success)` event has been durably persisted in the same
+/// [`SenderEventBuffer`] this provisional was minted against. Drain the
+/// buffer, then call [`Self::confirm`] to retrieve the PSBT as a base64
+/// string.
+///
+/// See [`ProvisionalConfirmError`] for the failure modes and lock-ordering
+/// notes that apply to all `Provisional*::confirm` methods.
+#[derive(uniffi::Object)]
+pub struct ProvisionalPsbt {
+    inner: Mutex<Option<payjoin::persist::Provisional<payjoin::bitcoin::Psbt>>>,
+}
+
+#[uniffi::export]
+impl ProvisionalPsbt {
+    /// Confirm against `buf`. See [`crate::receive::ProvisionalInitialized::confirm`]
+    /// for the shared failure-mode semantics.
+    pub fn confirm(&self, buf: &SenderEventBuffer) -> Result<String, ProvisionalConfirmError> {
+        let mut slot = self.inner.lock().expect("poisoned");
+        let p = slot.take().ok_or(ProvisionalConfirmError::AlreadyConsumed)?;
+        let buf_g = buf.inner.lock().expect("poisoned");
+        match p.confirm(&*buf_g) {
+            Ok(psbt) => Ok(psbt.to_string()),
+            Err(failure) => {
+                let kind = match failure.kind {
+                    payjoin::persist::ConfirmFailureKind::NotYetPersisted =>
+                        ProvisionalConfirmError::NotYetPersisted,
+                    payjoin::persist::ConfirmFailureKind::WrongBuffer =>
+                        ProvisionalConfirmError::WrongBuffer,
+                };
+                *slot = Some(failure.provisional);
+                Err(kind)
+            }
         }
     }
 }

@@ -596,7 +596,9 @@ impl App {
             let res = session.process_response(&response.bytes().await?, ctx, buf);
             persister.drain(buf)?;
             match res {
-                Ok(OptionalTransitionOutcome::Progress(psbt)) => {
+                Ok(OptionalTransitionOutcome::Progress(provisional_psbt)) => {
+                    let psbt =
+                        provisional_psbt.confirm(buf).expect("Closed(Success) was just drained");
                     println!("Proposal received. Processing...");
                     self.process_pj_response(psbt)?;
                     return Ok(());

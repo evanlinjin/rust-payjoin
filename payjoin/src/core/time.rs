@@ -42,6 +42,9 @@ impl Time {
         Time::from_unix_seconds(seconds).map_err(Convert)
     }
 
+    /// Returns this time as a Unix timestamp in seconds (since epoch).
+    pub(crate) fn to_unix(self) -> u64 { u64::from(self.0.to_consensus_u32()) }
+
     /// Encode as a Bitcoin consensus encoding of u32 UNIX timestamp.
     pub(crate) fn to_bytes(self) -> [u8; 4] {
         let t = self.0.to_consensus_u32();

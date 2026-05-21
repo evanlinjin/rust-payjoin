@@ -353,6 +353,19 @@ impl<S: State> Receiver<S> {
         buf.push(SessionEvent::Closed(SessionOutcome::Cancel));
         fallback
     }
+
+    /// The receiver's bitcoin address (the payjoin recipient).
+    pub fn address(&self) -> &Address { &self.session_context.address }
+
+    /// The store-and-forward payjoin directory URL.
+    pub fn directory(&self) -> &Url { &self.session_context.directory }
+
+    /// Session expiration as a Unix timestamp (seconds since epoch).
+    pub fn expiration_unix_secs(&self) -> u64 { self.session_context.expiration.to_unix() }
+
+    /// The expected payment amount, if the receiver specified one when
+    /// building the session.
+    pub fn amount(&self) -> Option<Amount> { self.session_context.amount }
 }
 
 #[derive(Debug, Clone)]

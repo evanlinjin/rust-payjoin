@@ -332,9 +332,10 @@ impl ReceiverSessionHistory {
 // Receiver typestates
 // =============================================================================
 
-/// Helper macro to add a `cancel` method to each typestate. Each invocation
-/// pushes a `Closed(Cancel)` event into `buf` and returns the fallback
-/// transaction (or `None` for early states that haven't seen one yet).
+/// Helper macro to add `cancel` plus session-metadata accessors to each
+/// receiver typestate. Wallet UIs need these for displaying "expires in
+/// X", "expects Y sats", "directory: …" without having to dig into the
+/// payjoin URI.
 macro_rules! impl_cancel_for_receiver {
     ($ty:ident) => {
         #[uniffi::export]
@@ -353,6 +354,19 @@ macro_rules! impl_cancel_for_receiver {
                 let mut g = buf.inner.lock().expect("poisoned");
                 self.0.clone().cancel(&mut *g).map(|tx| payjoin::bitcoin::consensus::serialize(&tx))
             }
+
+            /// The receiver's bitcoin address (the payjoin recipient).
+            pub fn address(&self) -> String { self.0.address().to_string() }
+
+            /// The store-and-forward payjoin directory URL.
+            pub fn directory(&self) -> String { self.0.directory().to_string() }
+
+            /// Session expiration as a Unix timestamp (seconds since epoch).
+            pub fn expiration_unix_secs(&self) -> u64 { self.0.expiration_unix_secs() }
+
+            /// The expected payment amount in satoshis, if the receiver
+            /// specified one when building the session.
+            pub fn amount_sats(&self) -> Option<u64> { self.0.amount().map(|a| a.to_sat()) }
         }
     };
 }

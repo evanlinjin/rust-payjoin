@@ -705,8 +705,10 @@ async function testIntegrationV2ToV2(): Promise<void> {
         }
     }
 
+    // Closed(Success) was just drained — confirm the provisional PSBT.
+    const psbtBase64 = pollOutcome.inner.confirm(senderBuf);
     const payjoinPsbt = JSON.parse(
-        sender.call("walletprocesspsbt", [pollOutcome.psbtBase64]),
+        sender.call("walletprocesspsbt", [psbtBase64]),
     ).psbt;
     const finalPsbtJson = JSON.parse(
         sender.call("finalizepsbt", [payjoinPsbt, JSON.stringify(false)]),

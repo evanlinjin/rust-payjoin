@@ -969,8 +969,8 @@ mod integration {
             send_persister.drain(&mut send_buf)?;
 
             let checked_payjoin_proposal_psbt =
-                if let OptionalTransitionOutcome::Progress(psbt) = response {
-                    psbt
+                if let OptionalTransitionOutcome::Progress(provisional_psbt) = response {
+                    provisional_psbt.confirm(&send_buf).expect("Closed(Success) was just drained")
                 } else {
                     panic!("psbt should exist");
                 };

@@ -369,11 +369,10 @@ class TestPayjoin(unittest.IsolatedAsyncioTestCase):
             if not hasattr(outcome, "inner"):
                 # Receiver still not ready; treat as acceptable in this smoke test.
                 return
+            # Closed(Success) was just drained — confirm the provisional PSBT.
+            psbt_base64 = outcome.inner.confirm(sender_buf)
             payjoin_psbt = json.loads(
-                self.sender.call(
-                    "walletprocesspsbt",
-                    [outcome.inner.psbt_base64],
-                )
+                self.sender.call("walletprocesspsbt", [psbt_base64])
             )["psbt"]
             final_psbt = json.loads(
                 self.sender.call("finalizepsbt", [payjoin_psbt, json.dumps(False)])

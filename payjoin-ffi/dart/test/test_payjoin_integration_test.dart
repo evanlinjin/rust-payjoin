@@ -677,10 +677,12 @@ void main() {
 
       final progressOutcome =
           poll_outcome as payjoin.ProgressPollingForProposalTransitionOutcome;
+      // Closed(Success) was just drained — confirm the provisional PSBT.
+      final psbtBase64 = progressOutcome.inner.confirm(buf: sender_buf);
       var payjoin_psbt = jsonDecode(
         sender.call(
           method: "walletprocesspsbt",
-          params: [progressOutcome.psbtBase64],
+          params: [psbtBase64],
         ),
       )["psbt"];
       var final_psbt = jsonDecode(

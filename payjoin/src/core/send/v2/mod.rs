@@ -251,6 +251,11 @@ impl<State> core::ops::DerefMut for Sender<State> {
 impl<State> Sender<State> {
     /// The endpoint in the Payjoin URI
     pub fn endpoint(&self) -> String { self.session_context.pj_param.endpoint().to_string() }
+
+    /// Session expiration as a Unix timestamp (seconds since epoch).
+    pub fn expiration_unix_secs(&self) -> u64 {
+        self.session_context.pj_param.expiration().to_unix()
+    }
 }
 
 impl<S: State> Sender<S> {
@@ -496,15 +501,25 @@ impl Sender<PollingForProposal> {
     /// ACCEPTED message indicating no Proposal PSBT is available yet.
     /// Otherwise, it returns an error with the encapsulated status code.
     ///
-    /// After this function is called, the sender can sign and finalize the
+    /// On `Progress`, the receiver's signed PSBT is wrapped in a [`Provisional`]
+    /// guarding it: the sender cannot sign and broadcast the proposal until the
+    /// producing `Closed(Success)` event has been durably persisted in `buf`.
+    /// Without this gate, a crash between broadcast and drain would replay the
+    /// session back at `PollingForProposal`, and (in the presence of
+    /// non-deterministic signing or rotated keys) the sender could end up
+    /// broadcasting a different PSBT spending the same inputs.
+    ///
+    /// After confirming the provisional, the sender can sign and finalize the
     /// PSBT and broadcast the resulting Payjoin transaction to the network.
     pub fn process_response(
         self,
         response: &[u8],
         ohttp_ctx: ohttp::ClientResponse,
         buf: &mut EventBuffer<SessionEvent>,
-    ) -> Result<OptionalTransitionOutcome<Psbt, Sender<PollingForProposal>>, ApiError<ResponseError>>
-    {
+    ) -> Result<
+        OptionalTransitionOutcome<Provisional<Psbt>, Sender<PollingForProposal>>,
+        ApiError<ResponseError>,
+    > {
         let body = match process_get_res(response, ohttp_ctx) {
             Ok(Some(body)) => body,
             Ok(None) => return Ok(OptionalTransitionOutcome::Stasis(self.clone())),
@@ -554,8 +569,9 @@ impl Sender<PollingForProposal> {
                 }
             };
 
-        buf.push(SessionEvent::Closed(SessionOutcome::Success(processed_proposal.clone())));
-        Ok(OptionalTransitionOutcome::Progress(processed_proposal))
+        let stamp =
+            buf.push(SessionEvent::Closed(SessionOutcome::Success(processed_proposal.clone())));
+        Ok(OptionalTransitionOutcome::Progress(Provisional::new(processed_proposal, stamp)))
     }
 }
 
