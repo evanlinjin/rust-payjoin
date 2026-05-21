@@ -3,7 +3,7 @@ use std::sync::Arc;
 use payjoin::bitcoin::psbt::PsbtParseError as CorePsbtParseError;
 use payjoin::send;
 
-use crate::error::{FfiValidationError, ImplementationError};
+use crate::error::FfiValidationError;
 
 /// Error building a Sender from a SenderBuilder.
 ///
@@ -35,7 +35,8 @@ impl From<CorePsbtParseError> for PsbtParseError {
     fn from(value: CorePsbtParseError) -> Self { PsbtParseError::InvalidPsbt(value.to_string()) }
 }
 
-/// Raised when inputs provided to the sender are malformed or sender build fails.
+/// Raised when inputs provided to the sender are malformed or sender build
+/// fails.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum SenderInputError {
     #[error(transparent)]
@@ -51,10 +52,6 @@ impl From<FfiValidationError> for SenderInputError {
 }
 
 /// Error returned when request could not be created.
-///
-/// This error can currently only happen due to programmer mistake.
-/// `unwrap()`ing it is thus considered OK in Rust but you may achieve nicer message by displaying
-/// it.
 #[derive(Debug, thiserror::Error, uniffi::Object)]
 #[uniffi::export(Debug, Display)]
 #[error(transparent)]
@@ -75,11 +72,7 @@ pub struct ValidationError(#[from] send::ValidationError);
 /// Represent an error returned by Payjoin receiver.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum ResponseError {
-    /// `WellKnown` Errors are defined in the [`BIP78::ReceiverWellKnownError`] spec.
-    ///
-    /// It is safe to display `WellKnown` errors to end users.
-    ///
-    /// [`BIP78::ReceiverWellKnownError`]: https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#user-content-Receivers_well_known_errors
+    /// `WellKnown` Errors are defined in the BIP78 spec.
     #[error("A receiver error occurred: {0}")]
     WellKnown(Arc<WellKnownError>),
 
@@ -87,12 +80,11 @@ pub enum ResponseError {
     #[error("An error occurred due to a malformed response: {0}")]
     Validation(Arc<ValidationError>),
 
-    /// `Unrecognized` Errors are NOT defined in the [`BIP78::ReceiverWellKnownError`] spec.
+    /// `Unrecognized` Errors are NOT defined in the BIP78 spec.
     ///
-    /// It is NOT safe to display `Unrecognized` errors to end users as they could be used
-    /// maliciously to phish a non technical user. Only display them in debug logs.
-    ///
-    /// [`BIP78::ReceiverWellKnownError`]: https://github.com/bitcoin/bips/blob/master/bip-0078.mediawiki#user-content-Receivers_well_known_errors
+    /// It is NOT safe to display `Unrecognized` errors to end users as they
+    /// could be used maliciously to phish a non technical user. Only display
+    /// them in debug logs.
     #[error("An unrecognized error occurred")]
     Unrecognized { error_code: String, msg: String },
 }
@@ -114,90 +106,76 @@ impl From<send::ResponseError> for ResponseError {
 #[error(transparent)]
 pub struct WellKnownError(#[from] send::WellKnownError);
 
-/// Error that may occur when the sender session event log is replayed
-#[derive(Debug, thiserror::Error, uniffi::Object)]
-#[uniffi::export(Debug, Display)]
-#[error(transparent)]
-pub struct SenderReplayError(
-    #[from] payjoin::error::ReplayError<send::v2::SendSession, send::v2::SessionEvent>,
-);
-
-/// Error that may occur during state machine transitions
+/// Surface-level error returned by sender action methods that operate on a
+/// [`crate::send::SenderEventBuffer`]. Storage errors are not represented here
+/// — those surface from the caller's drain loop.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
-#[error(transparent)]
-pub enum SenderPersistedError {
-    /// rust-payjoin sender Encapsulation error
-    #[error(transparent)]
-    EncapsulationError(Arc<EncapsulationError>),
-    /// rust-payjoin sender response error
-    #[error(transparent)]
-    ResponseError(ResponseError),
-    /// Sender Build error
-    #[error(transparent)]
-    BuildSenderError(Arc<BuildSenderError>),
-    /// Storage error that could occur at application storage layer
-    #[error(transparent)]
-    Storage(Arc<ImplementationError>),
-    /// Unexpected error
-    #[error("An unexpected error occurred")]
-    Unexpected,
+pub enum SenderApiError {
+    /// Retry the action from the same state.
+    #[error("Transient encapsulation error: {0}")]
+    TransientEncapsulation(Arc<EncapsulationError>),
+    /// Session is terminally closed (encapsulation error).
+    #[error("Fatal encapsulation error: {0}")]
+    FatalEncapsulation(Arc<EncapsulationError>),
+    /// Retry the action from the same state.
+    #[error("Transient response error: {0}")]
+    TransientResponse(ResponseError),
+    /// Session is terminally closed (response error).
+    #[error("Fatal response error: {0}")]
+    FatalResponse(ResponseError),
 }
 
-impl From<ImplementationError> for SenderPersistedError {
-    fn from(value: ImplementationError) -> Self { SenderPersistedError::Storage(Arc::new(value)) }
-}
+impl SenderApiError {
+    /// Convert from `ApiError<EncapsulationError>`.
+    pub(crate) fn from_api_error_encapsulation(
+        err: payjoin::persist::ApiError<send::v2::EncapsulationError>,
+    ) -> Self {
+        match err {
+            payjoin::persist::ApiError::Transient(e) =>
+                SenderApiError::TransientEncapsulation(Arc::new(e.into())),
+            payjoin::persist::ApiError::Fatal(e) =>
+                SenderApiError::FatalEncapsulation(Arc::new(e.into())),
+            payjoin::persist::ApiError::FatalWithState(e, _) =>
+                SenderApiError::FatalEncapsulation(Arc::new(e.into())),
+        }
+    }
 
-impl<S> From<payjoin::persist::PersistedError<send::v2::EncapsulationError, S>>
-    for SenderPersistedError
-where
-    S: std::error::Error + Send + Sync + 'static,
-{
-    fn from(err: payjoin::persist::PersistedError<send::v2::EncapsulationError, S>) -> Self {
-        if err.storage_error_ref().is_some() {
-            if let Some(storage_err) = err.storage_error() {
-                return SenderPersistedError::from(ImplementationError::new(storage_err));
-            }
-            return SenderPersistedError::Unexpected;
+    /// Convert from `ApiError<ResponseError>`.
+    pub(crate) fn from_api_error_response(
+        err: payjoin::persist::ApiError<send::ResponseError>,
+    ) -> Self {
+        match err {
+            payjoin::persist::ApiError::Transient(e) => SenderApiError::TransientResponse(e.into()),
+            payjoin::persist::ApiError::Fatal(e) => SenderApiError::FatalResponse(e.into()),
+            payjoin::persist::ApiError::FatalWithState(e, _) =>
+                SenderApiError::FatalResponse(e.into()),
         }
-        if let Some(api_err) = err.api_error() {
-            return SenderPersistedError::EncapsulationError(Arc::new(api_err.into()));
-        }
-        SenderPersistedError::Unexpected
     }
 }
 
-impl<S> From<payjoin::persist::PersistedError<send::ResponseError, S>> for SenderPersistedError
-where
-    S: std::error::Error + Send + Sync + 'static,
-{
-    fn from(err: payjoin::persist::PersistedError<send::ResponseError, S>) -> Self {
-        if err.storage_error_ref().is_some() {
-            if let Some(storage_err) = err.storage_error() {
-                return SenderPersistedError::from(ImplementationError::new(storage_err));
-            }
-            return SenderPersistedError::Unexpected;
-        }
-        if let Some(api_err) = err.api_error() {
-            return SenderPersistedError::ResponseError(api_err.into());
-        }
-        SenderPersistedError::Unexpected
+/// Error that may occur when the sender session event log is replayed.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum SenderReplayError {
+    /// Replay-time error from the library (invalid event sequence, etc.).
+    #[error("Replay error: {0}")]
+    Replay(String),
+    /// Stored event could not be deserialized as JSON.
+    #[error("Stored event JSON deserialization error: {0}")]
+    StorageSerde(String),
+}
+
+impl SenderReplayError {
+    pub(crate) fn storage_serde(e: serde_json::Error) -> Self {
+        SenderReplayError::StorageSerde(e.to_string())
     }
 }
 
-impl<S> From<payjoin::persist::PersistedError<send::BuildSenderError, S>> for SenderPersistedError
-where
-    S: std::error::Error + Send + Sync + 'static,
+impl From<payjoin::error::ReplayError<send::v2::SendSession, send::v2::SessionEvent>>
+    for SenderReplayError
 {
-    fn from(err: payjoin::persist::PersistedError<send::BuildSenderError, S>) -> Self {
-        if err.storage_error_ref().is_some() {
-            if let Some(storage_err) = err.storage_error() {
-                return SenderPersistedError::from(ImplementationError::new(storage_err));
-            }
-            return SenderPersistedError::Unexpected;
-        }
-        if let Some(api_err) = err.api_error() {
-            return SenderPersistedError::BuildSenderError(Arc::new(api_err.into()));
-        }
-        SenderPersistedError::Unexpected
+    fn from(
+        value: payjoin::error::ReplayError<send::v2::SendSession, send::v2::SessionEvent>,
+    ) -> Self {
+        SenderReplayError::Replay(value.to_string())
     }
 }

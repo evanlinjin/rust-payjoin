@@ -2,25 +2,25 @@ use std::sync::Arc;
 
 use payjoin::receive;
 
-use crate::error::{FfiValidationError, ImplementationError};
+use crate::error::{FfiValidationError, ForeignError, ImplementationError};
+use crate::receive::HasReplyableError;
 use crate::uri::error::IntoUrlError;
 
-/// The top-level error type for the payjoin receiver
+/// The top-level error type for the payjoin receiver.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[non_exhaustive]
 pub enum ReceiverError {
-    /// Error in underlying protocol function
+    /// Error in underlying protocol function.
     #[error("Protocol error: {0}")]
     Protocol(Arc<ProtocolError>),
     /// Error arising due to the specific receiver implementation
-    ///
-    /// e.g. database errors, network failures, wallet errors
+    /// (e.g. database errors, network failures, wallet errors).
     #[error("Implementation error: {0}")]
     Implementation(Arc<ImplementationError>),
-    /// Error that may occur when converting a some type to a URL
+    /// Error that may occur when converting a value into a URL.
     #[error("IntoUrl error: {0}")]
     IntoUrl(Arc<IntoUrlError>),
-    /// Catch-all for unhandled error variants
+    /// Catch-all for unhandled error variants.
     #[error("An unexpected error occurred")]
     Unexpected,
 }
@@ -38,56 +38,86 @@ impl From<receive::Error> for ReceiverError {
     }
 }
 
-/// Error that may occur during state machine transitions
+impl From<receive::ProtocolError> for ReceiverError {
+    fn from(value: receive::ProtocolError) -> Self {
+        ReceiverError::Protocol(Arc::new(ProtocolError(value)))
+    }
+}
+
+impl From<payjoin::ImplementationError> for ReceiverError {
+    fn from(value: payjoin::ImplementationError) -> Self {
+        ReceiverError::Implementation(Arc::new(ImplementationError::from(value)))
+    }
+}
+
+impl From<payjoin::IntoUrlError> for ReceiverError {
+    fn from(value: payjoin::IntoUrlError) -> Self { ReceiverError::IntoUrl(Arc::new(value.into())) }
+}
+
+/// Surface-level error returned by receiver action methods that operate on an
+/// [`crate::receive::ReceiverEventBuffer`]. Storage errors are not represented
+/// here — those surface from the caller's drain loop.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
-#[error(transparent)]
-pub enum ReceiverPersistedError {
-    /// rust-payjoin receiver error
-    #[error(transparent)]
-    Receiver(ReceiverError),
-    /// Storage error that could occur at application storage layer
-    #[error(transparent)]
-    Storage(Arc<ImplementationError>),
+pub enum ReceiverApiError {
+    /// Retry the action from the same state.
+    #[error("Transient error: {msg}")]
+    Transient { msg: String },
+    /// Session is terminally closed.
+    #[error("Fatal error: {msg}")]
+    Fatal { msg: String },
+    /// Fatal error that also produced a transition to [`HasReplyableError`].
+    /// The caller can use the returned state to reply to the sender.
+    #[error("Fatal error with replyable state: {msg}")]
+    FatalWithReplyableState { msg: String, state: Arc<HasReplyableError> },
+    /// FFI-layer validation failure (e.g. bad fee rate / amount input).
+    #[error("Input validation error: {0}")]
+    InputValidation(FfiValidationError),
+    /// FFI-layer deserialization failure (e.g. malformed transaction bytes).
+    #[error("Input deserialization error: {msg}")]
+    InputDeserialization { msg: String },
 }
 
-impl From<ImplementationError> for ReceiverPersistedError {
-    fn from(value: ImplementationError) -> Self { ReceiverPersistedError::Storage(Arc::new(value)) }
-}
-
-macro_rules! impl_persisted_error_from {
-    (
-        $api_error_ty:ty,
-        $receiver_arm:expr
-    ) => {
-        impl<S> From<payjoin::persist::PersistedError<$api_error_ty, S>> for ReceiverPersistedError
-        where
-            S: std::error::Error + Send + Sync + 'static,
-        {
-            fn from(err: payjoin::persist::PersistedError<$api_error_ty, S>) -> Self {
-                if err.storage_error_ref().is_some() {
-                    if let Some(storage_err) = err.storage_error() {
-                        return ReceiverPersistedError::from(ImplementationError::new(storage_err));
-                    }
-                    return ReceiverPersistedError::Receiver(ReceiverError::Unexpected);
-                }
-                if let Some(api_err) = err.api_error() {
-                    return ReceiverPersistedError::Receiver($receiver_arm(api_err));
-                }
-                ReceiverPersistedError::Receiver(ReceiverError::Unexpected)
-            }
+impl ReceiverApiError {
+    /// Convert from `ApiError<E>` (no error-state variant).
+    pub(crate) fn from_api_error<E: std::fmt::Display>(err: payjoin::persist::ApiError<E>) -> Self {
+        match err {
+            payjoin::persist::ApiError::Transient(e) =>
+                ReceiverApiError::Transient { msg: e.to_string() },
+            payjoin::persist::ApiError::Fatal(e) => ReceiverApiError::Fatal { msg: e.to_string() },
+            payjoin::persist::ApiError::FatalWithState(e, _) =>
+                ReceiverApiError::Fatal { msg: e.to_string() },
         }
-    };
+    }
+
+    /// Convert from `ApiError<E, Receiver<HasReplyableError>>` (with error-state).
+    pub(crate) fn from_api_error_with_replyable_state<E: std::fmt::Display>(
+        err: payjoin::persist::ApiError<
+            E,
+            payjoin::receive::v2::Receiver<payjoin::receive::v2::HasReplyableError>,
+        >,
+    ) -> Self {
+        match err {
+            payjoin::persist::ApiError::Transient(e) =>
+                ReceiverApiError::Transient { msg: e.to_string() },
+            payjoin::persist::ApiError::Fatal(e) => ReceiverApiError::Fatal { msg: e.to_string() },
+            payjoin::persist::ApiError::FatalWithState(e, state) =>
+                ReceiverApiError::FatalWithReplyableState {
+                    msg: e.to_string(),
+                    state: Arc::new(state.into()),
+                },
+        }
+    }
 }
 
-impl_persisted_error_from!(receive::ProtocolError, |api_err: receive::ProtocolError| {
-    ReceiverError::Protocol(Arc::new(api_err.into()))
-});
+impl From<FfiValidationError> for ReceiverApiError {
+    fn from(value: FfiValidationError) -> Self { ReceiverApiError::InputValidation(value) }
+}
 
-impl_persisted_error_from!(receive::Error, |api_err: receive::Error| api_err.into());
-
-impl_persisted_error_from!(payjoin::IntoUrlError, |api_err: payjoin::IntoUrlError| {
-    ReceiverError::IntoUrl(Arc::new(api_err.into()))
-});
+impl From<ForeignError> for ReceiverApiError {
+    fn from(value: ForeignError) -> Self {
+        ReceiverApiError::InputDeserialization { msg: value.to_string() }
+    }
+}
 
 /// Error that may occur when building a receiver session.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -127,29 +157,13 @@ impl From<payjoin::bitcoin::address::ParseError> for AddressParseError {
     }
 }
 
-/// The replyable error type for the payjoin receiver, representing failures need to be
-/// returned to the sender.
-///
-/// The error handling is designed to:
-/// 1. Provide structured error responses for protocol-level failures
-/// 2. Hide implementation details of external errors for security
-/// 3. Support proper error propagation through the receiver stack
-/// 4. Provide errors according to BIP-78 JSON error specifications for return
-///    after conversion into [`JsonReply`]
+/// The replyable error type for the payjoin receiver.
 #[derive(Debug, thiserror::Error, uniffi::Object)]
 #[uniffi::export(Debug, Display)]
 #[error(transparent)]
 pub struct ProtocolError(#[from] receive::ProtocolError);
 
 /// The standard format for errors that can be replied as JSON.
-///
-/// The JSON output includes the following fields:
-/// ```json
-/// {
-///     "errorCode": "specific-error-code",
-///     "message": "Human readable error message"
-/// }
-/// ```
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Object)]
 #[uniffi::export(Debug, Eq)]
 pub struct JsonReply(receive::JsonReply);
@@ -166,7 +180,7 @@ impl From<ProtocolError> for JsonReply {
     fn from(value: ProtocolError) -> Self { Self((&value.0).into()) }
 }
 
-/// Error that may occur during a v2 session typestate change
+/// Error that may occur during a v2 session typestate change.
 #[derive(Debug, thiserror::Error, uniffi::Object)]
 #[uniffi::export(Debug, Display)]
 #[error(transparent)]
@@ -209,7 +223,7 @@ pub struct SelectionError(#[from] receive::SelectionError);
 #[error(transparent)]
 pub struct InputContributionError(#[from] receive::InputContributionError);
 
-/// Error validating a PSBT Input
+/// Error validating a PSBT Input.
 #[derive(Debug, thiserror::Error, uniffi::Object)]
 #[uniffi::export(Debug, Display)]
 #[error(transparent)]
@@ -239,10 +253,29 @@ impl From<FfiValidationError> for InputPairError {
     fn from(value: FfiValidationError) -> Self { InputPairError::FfiValidation(value) }
 }
 
-/// Error that may occur when a receiver event log is replayed
-#[derive(Debug, thiserror::Error, uniffi::Object)]
-#[uniffi::export(Debug, Display)]
-#[error(transparent)]
-pub struct ReceiverReplayError(
-    #[from] payjoin::error::ReplayError<receive::v2::ReceiveSession, receive::v2::SessionEvent>,
-);
+/// Error that may occur when a receiver event log is replayed.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum ReceiverReplayError {
+    /// Replay-time error from the library (invalid event sequence, etc.).
+    #[error("Replay error: {0}")]
+    Replay(String),
+    /// Stored event could not be deserialized as JSON.
+    #[error("Stored event JSON deserialization error: {0}")]
+    StorageSerde(String),
+}
+
+impl ReceiverReplayError {
+    pub(crate) fn storage_serde(e: serde_json::Error) -> Self {
+        ReceiverReplayError::StorageSerde(e.to_string())
+    }
+}
+
+impl From<payjoin::error::ReplayError<receive::v2::ReceiveSession, receive::v2::SessionEvent>>
+    for ReceiverReplayError
+{
+    fn from(
+        value: payjoin::error::ReplayError<receive::v2::ReceiveSession, receive::v2::SessionEvent>,
+    ) -> Self {
+        ReceiverReplayError::Replay(value.to_string())
+    }
+}
