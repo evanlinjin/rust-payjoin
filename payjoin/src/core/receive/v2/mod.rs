@@ -54,8 +54,9 @@ use crate::ohttp::{
 };
 use crate::output_substitution::OutputSubstitution;
 use crate::persist::{
-    MaybeFatalOrSuccessTransition, MaybeFatalTransition, MaybeFatalTransitionWithNoResults,
-    MaybeSuccessTransition, MaybeTransientTransition, NextStateTransition, TerminalTransition,
+    EventBuffer, MaybeFatalOrSuccessTransition, MaybeFatalTransition,
+    MaybeFatalTransitionWithNoResults, MaybeSuccessTransition, MaybeTransientTransition,
+    NextStateTransition, Provisional, TerminalTransition,
 };
 use crate::receive::{
     check_references, parse_payload, InputOwnedTag, InputPair, InputSeenTag, OriginalPayload,
@@ -409,11 +410,16 @@ impl ReceiverBuilder {
         Self(SessionContext { max_fee_rate, ..self.0 })
     }
 
-    pub fn build(self) -> NextStateTransition<SessionEvent, Receiver<Initialized>> {
-        NextStateTransition::success(
-            SessionEvent::Created(self.0.clone()),
-            Receiver { state: Initialized {}, session_context: self.0 },
-        )
+    /// Stage the session for persistence. Pushes a [`SessionEvent::Created`]
+    /// into `buf` and returns a [`Provisional`] guarding [`Receiver<Initialized>`]:
+    /// the payjoin URI cannot be observed until the buffer's `Created` entry
+    /// is durably persisted and the provisional is confirmed.
+    ///
+    /// Caller drains `buf` through their storage of choice, then calls
+    /// [`Provisional::confirm`] to unlock the receiver.
+    pub fn build(self, buf: &mut EventBuffer<SessionEvent>) -> Provisional<Receiver<Initialized>> {
+        let seq = buf.push(SessionEvent::Created(self.0.clone()));
+        Provisional::new(Receiver { state: Initialized {}, session_context: self.0 }, seq)
     }
 }
 
@@ -1673,7 +1679,7 @@ pub mod test {
     use super::*;
     use crate::output_substitution::OutputSubstitution;
     use crate::persist::{
-        InMemoryPersister, OptionalTransitionOutcome, RejectTransient, Rejection,
+        InMemoryPersister, OptionalTransitionOutcome, RejectTransient, Rejection, SessionPersister,
     };
     use crate::receive::optional_parameters::Params;
     use crate::receive::v2;
@@ -2034,30 +2040,32 @@ pub mod test {
     #[test]
     fn default_max_fee_rate() {
         let persister = InMemoryPersister::default();
-        let receiver = ReceiverBuilder::new(
+        let mut buf = EventBuffer::new();
+        let provisional = ReceiverBuilder::new(
             SHARED_CONTEXT.address.clone(),
             SHARED_CONTEXT.directory.as_str(),
             SHARED_CONTEXT.ohttp_keys.clone(),
         )
         .expect("constructor on test vector should not fail")
-        .build()
-        .save(&persister)
-        .expect("Persister shouldn't fail");
+        .build(&mut buf);
+        persister.drain(&mut buf).expect("Persister shouldn't fail");
+        let receiver = provisional.confirm(&buf).expect("Created event durable");
 
         assert_eq!(receiver.session_context.max_fee_rate, FeeRate::BROADCAST_MIN);
 
         let non_default_max_fee_rate =
             FeeRate::from_sat_per_vb(1000).expect("Fee rate should be valid");
-        let receiver = ReceiverBuilder::new(
+        let mut buf = EventBuffer::new();
+        let provisional = ReceiverBuilder::new(
             SHARED_CONTEXT.address.clone(),
             SHARED_CONTEXT.directory.as_str(),
             SHARED_CONTEXT.ohttp_keys.clone(),
         )
         .expect("constructor on test vector should not fail")
         .with_max_fee_rate(non_default_max_fee_rate)
-        .build()
-        .save(&persister)
-        .expect("Persister shouldn't fail");
+        .build(&mut buf);
+        persister.drain(&mut buf).expect("Persister shouldn't fail");
+        let receiver = provisional.confirm(&buf).expect("Created event durable");
         assert_eq!(receiver.session_context.max_fee_rate, non_default_max_fee_rate);
     }
 
@@ -2065,27 +2073,29 @@ pub mod test {
     fn default_expiration() {
         let persister = InMemoryPersister::default();
 
-        let with_default_expiration = ReceiverBuilder::new(
+        let mut buf = EventBuffer::new();
+        let provisional = ReceiverBuilder::new(
             SHARED_CONTEXT.address.clone(),
             SHARED_CONTEXT.directory.as_str(),
             SHARED_CONTEXT.ohttp_keys.clone(),
         )
         .expect("constructor on test vector should not fail")
-        .build()
-        .save(&persister)
-        .expect("Persister shouldn't fail");
+        .build(&mut buf);
+        persister.drain(&mut buf).expect("Persister shouldn't fail");
+        let with_default_expiration = provisional.confirm(&buf).expect("Created event durable");
 
         let short_expiration = Duration::from_secs(60);
-        let with_short_expiration = ReceiverBuilder::new(
+        let mut buf = EventBuffer::new();
+        let provisional = ReceiverBuilder::new(
             SHARED_CONTEXT.address.clone(),
             SHARED_CONTEXT.directory.as_str(),
             SHARED_CONTEXT.ohttp_keys.clone(),
         )
         .expect("constructor on test vector should not fail")
         .with_expiration(short_expiration)
-        .build()
-        .save(&persister)
-        .expect("Persister shouldn't fail");
+        .build(&mut buf);
+        persister.drain(&mut buf).expect("Persister shouldn't fail");
+        let with_short_expiration = provisional.confirm(&buf).expect("Created event durable");
 
         assert_ne!(
             with_short_expiration.session_context.expiration,

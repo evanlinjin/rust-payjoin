@@ -104,9 +104,6 @@ impl<E> EventBuffer<E> {
     /// Crate-internal — transitions call this. Returns the seq number assigned
     /// to the event; `Provisional` records this to know when the event is
     /// durable.
-    ///
-    /// Currently used only by tests; receiver/sender transitions will call
-    /// this in follow-up PRs.
     #[allow(dead_code)]
     pub(crate) fn push(&mut self, e: E) -> u64 {
         self.pending.push_back(e);
@@ -132,6 +129,7 @@ pub type SenderEventBuffer = EventBuffer<crate::send::v2::SessionEvent>;
 /// Created by transitions that want persist-before-expose semantics; consumed
 /// via [`Self::confirm`]. Holding a `Provisional<T>` across an `await` or
 /// across threads is fine — it's a plain value, not a borrow.
+#[derive(Debug)]
 pub struct Provisional<T> {
     inner: T,
     needs_committed: u64,
@@ -849,14 +847,32 @@ impl<ApiErr: std::error::Error, StorageError: std::error::Error, ErrorState: fmt
     }
 }
 
+/// Protocol-level error returned by action methods that push events into an
+/// [`EventBuffer`]. Storage errors are not represented here — those surface
+/// from the caller's drain loop.
 #[derive(Debug)]
-pub(crate) enum ApiError<Err, ErrorState = ()> {
-    /// Error indicating that the session should be retried from the same state
+pub enum ApiError<Err, ErrorState = ()> {
+    /// Retry from the same state.
     Transient(Err),
-    /// Error indicating that the session is terminally closed
+    /// Session is terminally closed.
     Fatal(Err),
-    /// Fatal error that results in a state transition to ErrorState
+    /// Fatal error that also produced a state transition to `ErrorState`.
     FatalWithState(Err, ErrorState),
+}
+
+impl<Err: std::error::Error, ErrorState: fmt::Debug> fmt::Display for ApiError<Err, ErrorState> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::Transient(err) => write!(f, "Transient error: {err}"),
+            ApiError::Fatal(err) | ApiError::FatalWithState(err, _) =>
+                write!(f, "Fatal error: {err}"),
+        }
+    }
+}
+
+impl<Err: std::error::Error, ErrorState: fmt::Debug> std::error::Error
+    for ApiError<Err, ErrorState>
+{
 }
 
 #[derive(Debug)]
@@ -912,6 +928,27 @@ pub trait SessionPersister {
     /// This is invoked when the session is terminated due to a fatal error
     /// or when the session is closed due to a success state
     fn close(&self) -> Result<(), Self::InternalStorageError>;
+
+    /// Drain `buf` into this persister, committing each event in the buffer
+    /// immediately after its write succeeds.
+    ///
+    /// A panic between writes leaves the un-persisted suffix queued; storage
+    /// and buffer remain consistent.
+    fn drain(
+        &self,
+        buf: &mut EventBuffer<Self::SessionEvent>,
+    ) -> Result<(), Self::InternalStorageError>
+    where
+        Self::SessionEvent: Clone,
+    {
+        loop {
+            let Some(event) = buf.peek().next().cloned() else {
+                return Ok(());
+            };
+            self.save_event(event)?;
+            buf.commit(1);
+        }
+    }
 }
 
 /// Async version of [`SessionPersister`] for use in async contexts.
@@ -947,6 +984,25 @@ pub trait AsyncSessionPersister: Send + Sync {
     fn close(
         &self,
     ) -> impl std::future::Future<Output = Result<(), Self::InternalStorageError>> + Send;
+
+    /// Async counterpart to [`SessionPersister::drain`].
+    fn drain(
+        &self,
+        buf: &mut EventBuffer<Self::SessionEvent>,
+    ) -> impl std::future::Future<Output = Result<(), Self::InternalStorageError>> + Send
+    where
+        Self::SessionEvent: Clone,
+    {
+        async move {
+            loop {
+                let Some(event) = buf.peek().next().cloned() else {
+                    return Ok(());
+                };
+                self.save_event(event).await?;
+                buf.commit(1);
+            }
+        }
+    }
 }
 
 /// In-memory session persister for replaying sessions and introspecting events.

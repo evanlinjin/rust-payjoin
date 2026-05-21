@@ -565,7 +565,7 @@ mod test {
     use payjoin_test_utils::{BoxError, EXAMPLE_URL, KEM, KEY_ID, PARSED_ORIGINAL_PSBT, SYMMETRIC};
 
     use super::*;
-    use crate::persist::InMemoryPersister;
+    use crate::persist::{InMemoryPersister, SessionPersister};
     use crate::receive::v2::ReceiverBuilder;
     use crate::time::Time;
     use crate::OhttpKeys;
@@ -659,12 +659,13 @@ mod test {
         let ohttp_keys = OhttpKeys(
             ohttp::KeyConfig::new(KEY_ID, KEM, Vec::from(SYMMETRIC)).expect("valid key config"),
         );
-        let pj_uri = ReceiverBuilder::new(address.clone(), directory, ohttp_keys)
+        let recv_persister = InMemoryPersister::default();
+        let mut recv_buf = crate::persist::EventBuffer::new();
+        let provisional = ReceiverBuilder::new(address.clone(), directory, ohttp_keys)
             .expect("constructor on test vector should not fail")
-            .build()
-            .save(&InMemoryPersister::default())
-            .expect("receiver should succeed")
-            .pj_uri();
+            .build(&mut recv_buf);
+        recv_persister.drain(&mut recv_buf).expect("drain");
+        let pj_uri = provisional.confirm(&recv_buf).expect("Created event durable").pj_uri();
         let req_ctx = SenderBuilder::new(PARSED_ORIGINAL_PSBT.clone(), pj_uri.clone())
             .build_recommended(FeeRate::BROADCAST_MIN)
             .expect("build on test vector should succeed")

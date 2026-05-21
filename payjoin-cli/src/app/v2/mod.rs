@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Context, Result};
 use payjoin::bitcoin::consensus::encode::serialize_hex;
 use payjoin::bitcoin::{Amount, FeeRate};
-use payjoin::persist::{OptionalTransitionOutcome, SessionPersister};
+use payjoin::persist::{EventBuffer, OptionalTransitionOutcome, SessionPersister};
 use payjoin::receive::v2::{
     replay_event_log as replay_receiver_event_log, HasReplyableError, Initialized,
     MaybeInputsOwned, MaybeInputsSeen, Monitor, OutputsUnknown, PayjoinProposal,
@@ -281,12 +281,16 @@ impl AppTrait for App {
                 .await?
                 .ohttp_keys;
         let persister = ReceiverPersister::new(self.db.clone())?;
-        let session =
+        let mut buf = EventBuffer::new();
+        let provisional =
             ReceiverBuilder::new(address, self.config.v2()?.pj_directory.as_str(), ohttp_keys)?
                 .with_amount(amount)
                 .with_max_fee_rate(self.config.max_fee_rate.unwrap_or(FeeRate::BROADCAST_MIN))
-                .build()
-                .save(&persister)?;
+                .build(&mut buf);
+        persister.drain(&mut buf)?;
+        let session = provisional
+            .confirm(&buf)
+            .map_err(|_| anyhow::anyhow!("Created event should be durable after drain"))?;
 
         println!("Receive session established");
         let pj_uri = session.pj_uri();

@@ -196,7 +196,7 @@ mod integration {
 
         use bitcoin::{Address, Transaction};
         use http::StatusCode;
-        use payjoin::persist::OptionalTransitionOutcome;
+        use payjoin::persist::{EventBuffer, OptionalTransitionOutcome};
         use payjoin::receive::v2::{
             replay_event_log as replay_receiver_event_log, Monitor, PayjoinProposal,
             ReceiveSession, Receiver, ReceiverBuilder, SessionStatus, UncheckedOriginalPayload,
@@ -250,13 +250,17 @@ mod integration {
                 let mock_address = Address::from_str("tb1q6d3a2w975yny0asuvd9a67ner4nks58ff0q8g4")?
                     .assume_checked();
                 let persister = InMemoryPersister::default();
-                let bad_initializer = ReceiverBuilder::new(
+                let mut buf = EventBuffer::new();
+                let provisional = ReceiverBuilder::new(
                     mock_address,
                     services.directory_url().as_str(),
                     bad_ohttp_keys,
                 )?
-                .build()
-                .save(&persister)?;
+                .build(&mut buf);
+                persister.drain(&mut buf)?;
+                let bad_initializer = provisional
+                    .confirm(&buf)
+                    .map_err(|_| "Created event should be durable after drain")?;
                 let (req, _ctx) =
                     bad_initializer.create_poll_request(services.ohttp_relay_url().as_str())?;
                 agent
@@ -293,11 +297,15 @@ mod integration {
                 // Inside the Receiver:
                 let address = receiver.new_address()?;
                 // test session with expiration in the past
-                let expired_receiver =
+                let mut buf = EventBuffer::new();
+                let provisional =
                     ReceiverBuilder::new(address, services.directory_url().as_str(), ohttp_keys)?
                         .with_expiration(Duration::from_secs(0))
-                        .build()
-                        .save(&recv_persister)?;
+                        .build(&mut buf);
+                recv_persister.drain(&mut buf)?;
+                let expired_receiver = provisional
+                    .confirm(&buf)
+                    .map_err(|_| "Created event should be durable after drain")?;
                 match expired_receiver.create_poll_request(services.ohttp_relay_url().as_str()) {
                     // Internal error types are private, so check against a string
                     Err(err) => assert!(err.to_string().contains("expired")),
@@ -346,10 +354,14 @@ mod integration {
                 // Inside the Receiver:
                 let address = receiver.new_address()?;
 
-                let session =
+                let mut buf = EventBuffer::new();
+                let provisional =
                     ReceiverBuilder::new(address, services.directory_url().as_str(), ohttp_keys)?
-                        .build()
-                        .save(&persister)?;
+                        .build(&mut buf);
+                persister.drain(&mut buf)?;
+                let session = provisional
+                    .confirm(&buf)
+                    .map_err(|_| "Created event should be durable after drain")?;
                 println!("session: {:#?}", session);
                 // Poll receive request
                 let (req, ctx) =
@@ -802,10 +814,14 @@ mod integration {
             let address = receiver.new_address()?;
 
             // test session with expiration in the future
-            let session =
+            let mut buf = EventBuffer::new();
+            let provisional =
                 ReceiverBuilder::new(address, services.directory_url().as_str(), ohttp_keys)?
-                    .build()
-                    .save(recv_persister)?;
+                    .build(&mut buf);
+            recv_persister.drain(&mut buf)?;
+            let session = provisional
+                .confirm(&buf)
+                .map_err(|_| "Created event should be durable after drain")?;
             println!("session: {:#?}", session);
             // Poll receive request
             let (req, ctx) = session.create_poll_request(services.ohttp_relay_url().as_str())?;
@@ -994,13 +1010,17 @@ mod integration {
                 let ohttp_keys = services.fetch_ohttp_keys().await?;
                 let recv_persister = InMemoryPersister::default();
                 let address = receiver.new_address()?;
-                let session = ReceiverBuilder::new(
+                let mut buf = EventBuffer::new();
+                let provisional = ReceiverBuilder::new(
                     address,
                     services.directory_url().as_str(),
                     ohttp_keys.clone(),
                 )?
-                .build()
-                .save(&recv_persister)?;
+                .build(&mut buf);
+                recv_persister.drain(&mut buf)?;
+                let session = provisional
+                    .confirm(&buf)
+                    .map_err(|_| "Created event should be durable after drain")?;
 
                 // **********************
                 // Inside the V1 Sender:
