@@ -273,10 +273,11 @@ class TestPayjoin(unittest.IsolatedAsyncioTestCase):
         recv_persister: InMemoryReceiverPersister,
         recv_buf: ReceiverEventBuffer,
     ):
-        payjoin_proposal = proposal.finalize_proposal(
+        provisional = proposal.finalize_proposal(
             ProcessPsbtCallback(self.receiver), recv_buf
         )
         recv_persister.drain(recv_buf)
+        payjoin_proposal = provisional.confirm(recv_buf)
         return ReceiveSession.PAYJOIN_PROPOSAL(payjoin_proposal)
 
     async def test_integration_v2_to_v2(self):

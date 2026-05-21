@@ -1247,13 +1247,20 @@ impl Receiver<ProvisionalProposal> {
     /// they re-sign the transaction and broadcast it to the network.
     ///
     /// Finalization consists of two steps:
-    ///   1. Remove all sender signatures which were received with the original PSBT as these signatures are now invalid.
-    ///   2. Sign and finalize the resulting PSBT using the passed `wallet_process_psbt` signing function.
+    ///   1. Remove all sender signatures which were received with the original PSBT as these
+    ///      signatures are now invalid.
+    ///   2. Sign and finalize the resulting PSBT using the passed `wallet_process_psbt` signing
+    ///      function.
+    ///
+    /// Returns a [`Provisional`] guarding the [`PayjoinProposal`]: the proposal cannot be posted
+    /// to the directory until the buffer's `FinalizedProposal` entry is durably persisted and
+    /// the provisional is confirmed. Without this gate, a crash between finalize and drain would
+    /// let the receiver re-sign and re-post a different PSBT after replay.
     pub fn finalize_proposal(
         self,
         wallet_process_psbt: impl Fn(&Psbt) -> Result<Psbt, ImplementationError>,
         buf: &mut EventBuffer<SessionEvent>,
-    ) -> Result<Receiver<PayjoinProposal>, ApiError<ImplementationError>> {
+    ) -> Result<Provisional<Receiver<PayjoinProposal>>, ApiError<ImplementationError>> {
         let psbt = self.psbt_to_sign();
         let signed_psbt = wallet_process_psbt(&psbt);
         match signed_psbt {
@@ -1275,11 +1282,14 @@ impl Receiver<ProvisionalProposal> {
     /// This takes a receiver signed PSBT payjoin proposal and finalizes it for broadcast to
     /// the sender. Use [`Receiver<ProvisionalProposal>::psbt_to_sign`] to obtain the payjoin
     /// proposal's unsigned PSBT for receiver to sign and return here.
+    ///
+    /// Returns a [`Provisional`] guarding the [`PayjoinProposal`]; see [`Self::finalize_proposal`]
+    /// for the persist-before-expose semantics.
     pub fn finalize_signed_proposal(
         self,
         signed_psbt: &Psbt,
         buf: &mut EventBuffer<SessionEvent>,
-    ) -> Result<Receiver<PayjoinProposal>, ApiError<ImplementationError>> {
+    ) -> Result<Provisional<Receiver<PayjoinProposal>>, ApiError<ImplementationError>> {
         let original_psbt = self.state.psbt_context.original_psbt.clone();
         let payjoin_psbt =
             match self.state.psbt_context.finalize_signed_proposal(signed_psbt.clone()) {
@@ -1288,8 +1298,11 @@ impl Receiver<ProvisionalProposal> {
             };
         let psbt_context = PsbtContext { payjoin_psbt: payjoin_psbt.clone(), original_psbt };
         let payjoin_proposal = PayjoinProposal { psbt_context: psbt_context.clone() };
-        buf.push(SessionEvent::FinalizedProposal(payjoin_psbt));
-        Ok(Receiver { state: payjoin_proposal, session_context: self.session_context })
+        let stamp = buf.push(SessionEvent::FinalizedProposal(payjoin_psbt));
+        Ok(Provisional::new(
+            Receiver { state: payjoin_proposal, session_context: self.session_context },
+            stamp,
+        ))
     }
 
     pub(crate) fn apply_payjoin_proposal(self, payjoin_psbt: Psbt) -> ReceiveSession {

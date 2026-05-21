@@ -1314,7 +1314,7 @@ mod integration {
 
             // Sign and finalize the proposal PSBT
             let mut buf = EventBuffer::new();
-            let payjoin = payjoin
+            let provisional = payjoin
                 .finalize_proposal(
                     |psbt: &Psbt| {
                         receiver
@@ -1334,6 +1334,9 @@ mod integration {
                 )
                 .map_err(|e| format!("finalize_proposal failed: {e:?}"))?;
             recv_persister.drain(&mut buf)?;
+            let payjoin = provisional
+                .confirm(&buf)
+                .expect("staged payjoin proposal should confirm after drain");
             Ok(payjoin)
         }
 

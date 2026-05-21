@@ -201,12 +201,12 @@ async function processProvisionalProposal(
     recvPersister: InMemoryReceiverPersister,
     recvBuf: payjoin.ReceiverEventBuffer,
 ): Promise<payjoin.PayjoinProposal> {
-    const payjoinProposal = proposal.finalizeProposal(
+    const provisional = proposal.finalizeProposal(
         new ProcessPsbtCallback(receiver),
         recvBuf,
     );
     recvPersister.drain(recvBuf);
-    return payjoinProposal;
+    return provisional.confirm(recvBuf);
 }
 
 async function processWantsFeeRange(

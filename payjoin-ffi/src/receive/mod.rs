@@ -1106,11 +1106,15 @@ pub trait ProcessPsbt: Send + Sync {
 
 #[uniffi::export]
 impl ProvisionalProposal {
+    /// Finalize the proposal. Returns a [`ProvisionalPayjoinProposal`] guarding
+    /// the [`PayjoinProposal`] — the proposal cannot be posted to the directory
+    /// until the `FinalizedProposal` event is durable and the provisional is
+    /// confirmed.
     pub fn finalize_proposal(
         &self,
         process_psbt: Arc<dyn ProcessPsbt>,
         buf: &ReceiverEventBuffer,
-    ) -> Result<Arc<PayjoinProposal>, ReceiverApiError> {
+    ) -> Result<Arc<ProvisionalPayjoinProposal>, ReceiverApiError> {
         let mut g = buf.inner.lock().expect("poisoned");
         self.0
             .clone()
@@ -1123,7 +1127,7 @@ impl ProvisionalProposal {
                 },
                 &mut g,
             )
-            .map(|r| Arc::new(r.into()))
+            .map(|p| Arc::new(ProvisionalPayjoinProposal { inner: Mutex::new(Some(p)) }))
             .map_err(ReceiverApiError::from_api_error)
     }
 
@@ -1133,7 +1137,7 @@ impl ProvisionalProposal {
         &self,
         signed_psbt: String,
         buf: &ReceiverEventBuffer,
-    ) -> Result<Arc<PayjoinProposal>, ReceiverApiError> {
+    ) -> Result<Arc<ProvisionalPayjoinProposal>, ReceiverApiError> {
         let mut g = buf.inner.lock().expect("poisoned");
         self.0
             .clone()
@@ -1141,8 +1145,53 @@ impl ProvisionalProposal {
                 |_| Ok(Psbt::from_str(&signed_psbt).map_err(ImplementationError::new)?),
                 &mut g,
             )
-            .map(|r| Arc::new(r.into()))
+            .map(|p| Arc::new(ProvisionalPayjoinProposal { inner: Mutex::new(Some(p)) }))
             .map_err(ReceiverApiError::from_api_error)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Provisional<Receiver<PayjoinProposal>>
+// -----------------------------------------------------------------------------
+
+/// A payjoin proposal staged for persistence by
+/// [`ProvisionalProposal::finalize_proposal`] (or `finalize_signed_proposal`).
+///
+/// The proposal cannot be posted to the directory until the producing
+/// `FinalizedProposal` event has been durably persisted in the same
+/// [`ReceiverEventBuffer`] this provisional was minted against. Drain the
+/// buffer, then call [`Self::confirm`].
+#[derive(uniffi::Object)]
+pub struct ProvisionalPayjoinProposal {
+    inner: Mutex<
+        Option<
+            payjoin::persist::Provisional<
+                payjoin::receive::v2::Receiver<payjoin::receive::v2::PayjoinProposal>,
+            >,
+        >,
+    >,
+}
+
+#[uniffi::export]
+impl ProvisionalPayjoinProposal {
+    /// Confirm against `buf`. Returns the [`PayjoinProposal`] if the producing
+    /// event is durable in `buf`, otherwise returns
+    /// [`ProvisionalConfirmError::NotYetPersisted`] and leaves the provisional
+    /// reusable for retry.
+    pub fn confirm(
+        &self,
+        buf: &ReceiverEventBuffer,
+    ) -> Result<Arc<PayjoinProposal>, ProvisionalConfirmError> {
+        let mut slot = self.inner.lock().expect("poisoned");
+        let p = slot.take().ok_or(ProvisionalConfirmError::AlreadyConsumed)?;
+        let buf_g = buf.inner.lock().expect("poisoned");
+        match p.confirm(&*buf_g) {
+            Ok(proposal) => Ok(Arc::new(proposal.into())),
+            Err(returned) => {
+                *slot = Some(returned);
+                Err(ProvisionalConfirmError::NotYetPersisted)
+            }
+        }
     }
 }
 

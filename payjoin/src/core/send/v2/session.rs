@@ -263,6 +263,7 @@ mod tests {
         .build_recommended(FeeRate::BROADCAST_MIN, &mut buf)
         .unwrap();
         send_persister.drain(&mut buf).unwrap();
+        let sender = sender.confirm(&buf).expect("confirm");
         let test = SessionHistoryTest {
             events: vec![SessionEvent::Created(Box::new(sender.session_context.clone()))],
             expected_session_history: SessionHistoryExpectedOutcome {
@@ -286,7 +287,7 @@ mod tests {
         let psbt = PARSED_ORIGINAL_PSBT.clone();
         let send_persister: InMemoryPersister<SessionEvent> = InMemoryPersister::default();
         let mut buf = crate::persist::EventBuffer::new();
-        let mut sender = SenderBuilder::new(
+        let sender = SenderBuilder::new(
             psbt.clone(),
             Uri::try_from(PJ_URI)
                 .expect("Valid uri")
@@ -297,6 +298,7 @@ mod tests {
         .build_recommended(FeeRate::BROADCAST_MIN, &mut buf)
         .unwrap();
         send_persister.drain(&mut buf).unwrap();
+        let mut sender = sender.confirm(&buf).expect("confirm");
         sender.session_context.pj_param.expiration =
             Time::from_now(std::time::Duration::from_secs(60)).unwrap();
         let test = SessionHistoryTest {
@@ -333,6 +335,7 @@ mod tests {
         .build_recommended(FeeRate::BROADCAST_MIN, &mut buf)
         .unwrap();
         send_persister.drain(&mut buf).unwrap();
+        let sender = sender.confirm(&buf).expect("confirm");
 
         let reply_key = HpkeKeyPair::gen_keypair();
         let endpoint = Url::parse(&sender.endpoint()).expect("Could not parse url");

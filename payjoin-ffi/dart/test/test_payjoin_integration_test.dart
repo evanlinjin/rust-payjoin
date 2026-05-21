@@ -207,11 +207,12 @@ Future<payjoin.PayjoinProposalReceiveSession> process_provisional_proposal(
   InMemoryReceiverPersister recv_persister,
   payjoin.ReceiverEventBuffer recv_buf,
 ) async {
-  final payjoin_proposal = proposal.finalizeProposal(
+  final provisional = proposal.finalizeProposal(
     processPsbt: ProcessPsbtCallback(receiver),
     buf: recv_buf,
   );
   recv_persister.drain(recv_buf);
+  final payjoin_proposal = provisional.confirm(buf: recv_buf);
   return payjoin.PayjoinProposalReceiveSession(payjoin_proposal);
 }
 

@@ -840,7 +840,7 @@ impl App {
         buf: &mut EventBuffer<payjoin::receive::v2::SessionEvent>,
     ) -> Result<()> {
         let wallet = self.wallet();
-        let proposal = proposal
+        let provisional = proposal
             .finalize_proposal(
                 |psbt| {
                     wallet
@@ -851,6 +851,8 @@ impl App {
             )
             .map_err(|e| anyhow!("finalize_proposal: {e:?}"))?;
         persister.drain(buf)?;
+        let proposal =
+            provisional.confirm(buf).expect("staged payjoin proposal should confirm after drain");
         self.send_payjoin_proposal(proposal, persister, buf).await
     }
 

@@ -673,6 +673,7 @@ mod test {
             .build_recommended(FeeRate::BROADCAST_MIN, &mut send_buf)
             .expect("build on test vector should succeed");
         send_persister.drain(&mut send_buf).expect("drain");
+        let req_ctx = req_ctx.confirm(&send_buf).expect("confirm");
         // v2 senders may always override the receiver's `pjos` parameter to enable output
         // substitution
         assert_eq!(
@@ -694,6 +695,7 @@ mod test {
             .build_non_incentivizing(FeeRate::BROADCAST_MIN, &mut send_buf)
             .expect("build on test vector should succeed");
         send_persister.drain(&mut send_buf).expect("drain");
+        let req_ctx = req_ctx.confirm(&send_buf).expect("confirm");
         assert_eq!(
             req_ctx.session_context.psbt_ctx.output_substitution,
             OutputSubstitution::Enabled
@@ -709,6 +711,7 @@ mod test {
             )
             .expect("build on test vector should succeed");
         send_persister.drain(&mut send_buf).expect("drain");
+        let req_ctx = req_ctx.confirm(&send_buf).expect("confirm");
         assert_eq!(
             req_ctx.session_context.psbt_ctx.output_substitution,
             OutputSubstitution::Enabled
@@ -720,6 +723,7 @@ mod test {
             .build_recommended(FeeRate::BROADCAST_MIN, &mut send_buf)
             .expect("build on test vector should succeed");
         send_persister.drain(&mut send_buf).expect("drain");
+        let req_ctx = req_ctx.confirm(&send_buf).expect("confirm");
         assert_eq!(
             req_ctx.session_context.psbt_ctx.output_substitution,
             OutputSubstitution::Disabled

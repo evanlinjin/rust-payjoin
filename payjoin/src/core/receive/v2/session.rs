@@ -229,11 +229,12 @@ mod tests {
             .apply_fee_range(None, None, &mut buf)
             .expect("apply_fee_range should not fail");
         persister.drain(&mut buf).expect("drain");
-        let payjoin_proposal = provisional_proposal
+        let provisional_payjoin = provisional_proposal
             .clone()
             .finalize_proposal(|psbt| Ok(psbt.clone()), &mut buf)
             .expect("Payjoin proposal should be finalized");
         persister.drain(&mut buf).expect("drain");
+        let payjoin_proposal = provisional_payjoin.confirm(&buf).expect("confirm");
 
         let test_cases = vec![
             SessionEvent::Created(SHARED_CONTEXT.clone()),
@@ -546,11 +547,12 @@ mod tests {
             .apply_fee_range(None, None, &mut buf)
             .expect("Contributed inputs should be valid");
         persister.drain(&mut buf).expect("drain");
-        let payjoin_proposal = provisional_proposal
+        let provisional_payjoin = provisional_proposal
             .clone()
             .finalize_proposal(|psbt| Ok(psbt.clone()), &mut buf)
             .expect("Payjoin proposal should be finalized");
         persister.drain(&mut buf).expect("drain");
+        let payjoin_proposal = provisional_payjoin.confirm(&buf).expect("confirm");
         let expected_fallback = maybe_inputs_owned.extract_tx_to_schedule_broadcast();
         let reply_key = Some(crate::HpkeKeyPair::gen_keypair().1);
 
