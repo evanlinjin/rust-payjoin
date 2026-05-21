@@ -681,10 +681,11 @@ mod tests {
 
         let original = original_from_test_vector();
         // Original PSBT is not broadcastable
+        let mut buf = crate::persist::EventBuffer::new();
         let _unbroadcastable = unchecked_receiver_from_test_vector()
-            .check_broadcast_suitability(None, |_| Ok(false))
-            .save(&persister)
+            .check_broadcast_suitability(None, |_| Ok(false), &mut buf)
             .expect_err("Unbroadcastable should error");
+        persister.drain(&mut buf).expect("drain");
         // NOTE: it would be good to assert against the internal error type but InternalPersistedError is private
         let expected_error = PayloadError(InternalPayloadError::OriginalPsbtNotBroadcastable);
         let reply_key = Some(crate::HpkeKeyPair::gen_keypair().1);
@@ -717,10 +718,11 @@ mod tests {
 
         let original = original_from_test_vector();
         // Mock some implementation error
+        let mut buf = crate::persist::EventBuffer::new();
         let _maybe_broadcastable = unchecked_receiver_from_test_vector()
-            .check_broadcast_suitability(None, |_| Err("mock error".into()))
-            .save(&persister)
+            .check_broadcast_suitability(None, |_| Err("mock error".into()), &mut buf)
             .expect_err("Mock error should error");
+        persister.drain(&mut buf).expect("drain");
         // NOTE: it would be good to assert against the internal error type but InternalPersistedError is private
 
         let reply_key = Some(crate::HpkeKeyPair::gen_keypair().1);

@@ -1171,19 +1171,25 @@ mod integration {
             custom_inputs: Option<Vec<InputPair>>,
         ) -> Result<Receiver<PayjoinProposal>, BoxError> {
             // Receive Check 1: Can Broadcast
+            let mut buf = EventBuffer::new();
             let proposal = proposal
-                .check_broadcast_suitability(None, |tx| {
-                    Ok(receiver
-                        .test_mempool_accept(std::slice::from_ref(tx))
-                        .map_err(ImplementationError::new)?
-                        .0
-                        .first()
-                        .ok_or(ImplementationError::from(
-                            "testmempoolaccept should return a result",
-                        ))?
-                        .allowed)
-                })
-                .save(recv_persister)?;
+                .check_broadcast_suitability(
+                    None,
+                    |tx| {
+                        Ok(receiver
+                            .test_mempool_accept(std::slice::from_ref(tx))
+                            .map_err(ImplementationError::new)?
+                            .0
+                            .first()
+                            .ok_or(ImplementationError::from(
+                                "testmempoolaccept should return a result",
+                            ))?
+                            .allowed)
+                    },
+                    &mut buf,
+                )
+                .map_err(|e| format!("check_broadcast_suitability failed: {e:?}"))?;
+            recv_persister.drain(&mut buf)?;
 
             // in a payment processor where the sender could go offline, this is where you schedule to broadcast the original_tx
             let _to_broadcast_in_failure_case = proposal.extract_tx_to_schedule_broadcast();

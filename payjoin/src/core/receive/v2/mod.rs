@@ -641,17 +641,13 @@ impl Receiver<UncheckedOriginalPayload> {
         self,
         min_fee_rate: Option<FeeRate>,
         can_broadcast: impl Fn(&bitcoin::Transaction) -> Result<bool, ImplementationError>,
-    ) -> MaybeFatalTransition<
-        SessionEvent,
-        Receiver<MaybeInputsOwned>,
-        Error,
-        Receiver<HasReplyableError>,
-    > {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Receiver<MaybeInputsOwned>, ApiError<Error, Receiver<HasReplyableError>>> {
         let tx = self.extract_tx_to_check_broadcast_suitability();
         match can_broadcast(&tx) {
             Ok(is_broadcast_suitable) =>
-                self.apply_broadcast_suitability(min_fee_rate, is_broadcast_suitable),
-            Err(e) => MaybeFatalTransition::transient(e.into()),
+                self.apply_broadcast_suitability(min_fee_rate, is_broadcast_suitable, buf),
+            Err(e) => Err(ApiError::Transient(e.into())),
         }
     }
 
@@ -702,30 +698,28 @@ impl Receiver<UncheckedOriginalPayload> {
         self,
         min_fee_rate: Option<FeeRate>,
         is_broadcast_suitable: bool,
-    ) -> MaybeFatalTransition<
-        SessionEvent,
-        Receiver<MaybeInputsOwned>,
-        Error,
-        Receiver<HasReplyableError>,
-    > {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Receiver<MaybeInputsOwned>, ApiError<Error, Receiver<HasReplyableError>>> {
         match self.state.original.apply_broadcast_suitability(min_fee_rate, is_broadcast_suitable) {
-            Ok(()) => MaybeFatalTransition::success(
-                SessionEvent::CheckedBroadcastSuitability(),
-                Receiver {
+            Ok(()) => {
+                buf.push(SessionEvent::CheckedBroadcastSuitability());
+                Ok(Receiver {
                     state: MaybeInputsOwned { original: self.original.clone() },
                     session_context: self.session_context,
-                },
-            ),
-            Err(Error::Implementation(e)) =>
-                MaybeFatalTransition::transient(Error::Implementation(e)),
-            Err(e) => MaybeFatalTransition::replyable_error(
-                SessionEvent::GotReplyableError((&e).into()),
-                Receiver {
-                    state: HasReplyableError { error_reply: (&e).into() },
-                    session_context: self.session_context,
-                },
-                e,
-            ),
+                })
+            }
+            Err(Error::Implementation(e)) => Err(ApiError::Transient(Error::Implementation(e))),
+            Err(e) => {
+                let error_reply: JsonReply = (&e).into();
+                buf.push(SessionEvent::GotReplyableError(error_reply.clone()));
+                Err(ApiError::FatalWithState(
+                    e,
+                    Receiver {
+                        state: HasReplyableError { error_reply },
+                        session_context: self.session_context,
+                    },
+                ))
+            }
         }
     }
 
@@ -1720,12 +1714,15 @@ pub mod test {
             state: unchecked_proposal_v2_from_test_vector(),
             session_context: SHARED_CONTEXT.clone(),
         };
+        let mut buf = EventBuffer::new();
         let error = receiver
             .clone()
-            .check_broadcast_suitability(None, |_| Err("mock error".into()))
-            .save(&persister)
+            .check_broadcast_suitability(None, |_| Err("mock error".into()), &mut buf)
             .expect_err("Server error should be populated with mock error");
-        let res = error.api_error().expect("check_broadcast error should propagate to api error");
+        persister.drain(&mut buf).expect("drain");
+        let res = match error {
+            ApiError::Transient(e) | ApiError::Fatal(e) | ApiError::FatalWithState(e, _) => e,
+        };
         JsonReply::from(&res)
     }
 
@@ -1866,14 +1863,15 @@ pub mod test {
         let receiver =
             v2::Receiver { state: unchecked_proposal, session_context: SHARED_CONTEXT.clone() };
 
-        let unchecked_proposal = receiver.check_broadcast_suitability(Some(FeeRate::MIN), |_| {
-            Err(ImplementationError::new(Error::Implementation("mock error".into())))
-        });
+        let mut buf = EventBuffer::new();
+        let unchecked_proposal = receiver.check_broadcast_suitability(
+            Some(FeeRate::MIN),
+            |_| Err(ImplementationError::new(Error::Implementation("mock error".into()))),
+            &mut buf,
+        );
 
         match unchecked_proposal {
-            MaybeFatalTransition(Err(Rejection::Transient(RejectTransient(
-                Error::Implementation(error),
-            )))) => assert_eq!(
+            Err(ApiError::Transient(Error::Implementation(error))) => assert_eq!(
                 error.to_string(),
                 Error::Implementation("mock error".into()).to_string()
             ),
@@ -1890,11 +1888,15 @@ pub mod test {
         let receiver =
             v2::Receiver { state: unchecked_proposal, session_context: SHARED_CONTEXT.clone() };
 
+        let mut buf = EventBuffer::new();
         let unchecked_proposal_err = receiver
-            .check_broadcast_suitability(Some(FeeRate::MIN), |_| Ok(false))
-            .save(&persister)
+            .check_broadcast_suitability(Some(FeeRate::MIN), |_| Ok(false), &mut buf)
             .expect_err("should have replyable error");
-        let has_error = unchecked_proposal_err.error_state().expect("should have state");
+        persister.drain(&mut buf).expect("drain");
+        let has_error = match unchecked_proposal_err {
+            ApiError::FatalWithState(_, state) => state,
+            _ => panic!("expected FatalWithState"),
+        };
 
         let _err_req = has_error.create_error_request(EXAMPLE_URL)?;
         Ok(())
