@@ -41,12 +41,45 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-unique identifier for an [`EventBuffer`] instance.
+///
+/// [`Provisional`] stamps the id of the buffer it was minted against; on
+/// [`Provisional::confirm`] the recorded id must match the buffer's, otherwise
+/// the wrong-buffer attempt is rejected. Buffer ids are issued by a static
+/// counter at construction and are never reused within a process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BufferId(u64);
+
+impl BufferId {
+    fn next() -> Self {
+        // SeqCst is overkill but unambiguous; ids are issued rarely.
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        BufferId(NEXT.fetch_add(1, Ordering::SeqCst))
+    }
+}
+
+/// Witness recording where (which buffer) and when (which seq number) an
+/// event was staged. Returned by [`EventBuffer::push`] and stamped into
+/// [`Provisional`] so a confirm against an unrelated buffer can be rejected.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EventStamp {
+    buffer_id: BufferId,
+    seq: u64,
+}
 
 /// Caller-owned, sans-IO event buffer. Transitions push events into it;
 /// the caller's persister drains it two-phase (peek + commit).
 ///
 /// Generic over the event type so receiver and sender sessions use distinct,
 /// non-interchangeable buffer types.
+///
+/// Each buffer carries a process-unique [`BufferId`] issued at construction.
+/// A [`Provisional`] minted against one buffer can only be confirmed against
+/// the same buffer instance — confirming against a freshly created or
+/// unrelated buffer is rejected, so the persist-before-expose invariant is
+/// structural rather than positional.
 ///
 /// # Two-phase drain
 ///
@@ -61,6 +94,7 @@ use std::fmt;
 /// [`EventBuffer::after_replay`] so [`Self::committed_count`] reflects the
 /// number of events already durable.
 pub struct EventBuffer<E> {
+    id: BufferId,
     pending: VecDeque<E>,
     /// Monotonic count of events ever pushed across the buffer's lifetime.
     /// `committed_count() == pushed_total - pending.len()`. Used by
@@ -69,14 +103,19 @@ pub struct EventBuffer<E> {
 }
 
 impl<E> EventBuffer<E> {
-    /// Construct an empty buffer.
-    pub fn new() -> Self { Self { pending: VecDeque::new(), pushed_total: 0 } }
+    /// Construct an empty buffer with a fresh [`BufferId`].
+    pub fn new() -> Self {
+        Self { id: BufferId::next(), pending: VecDeque::new(), pushed_total: 0 }
+    }
 
     /// Construct a buffer reflecting that `replayed` events were already
     /// persisted before this session woke up. Use after replaying a log.
     pub fn after_replay(replayed: u64) -> Self {
-        Self { pending: VecDeque::new(), pushed_total: replayed }
+        Self { id: BufferId::next(), pending: VecDeque::new(), pushed_total: replayed }
     }
+
+    /// Identifier issued at construction; stable for the buffer's lifetime.
+    pub fn id(&self) -> BufferId { self.id }
 
     /// Returns `true` if no events are queued for persistence.
     pub fn is_empty(&self) -> bool { self.pending.is_empty() }
@@ -101,14 +140,14 @@ impl<E> EventBuffer<E> {
         }
     }
 
-    /// Crate-internal — transitions call this. Returns the seq number assigned
-    /// to the event; `Provisional` records this to know when the event is
-    /// durable.
-    #[allow(dead_code)]
-    pub(crate) fn push(&mut self, e: E) -> u64 {
+    /// Crate-internal — transitions call this. Returns an [`EventStamp`]
+    /// recording this buffer's id and the seq number the event landed at;
+    /// `Provisional` records this so `confirm` can reject an unrelated
+    /// buffer with a coincidentally-matching seq.
+    pub(crate) fn push(&mut self, e: E) -> EventStamp {
         self.pending.push_back(e);
         self.pushed_total += 1;
-        self.pushed_total
+        EventStamp { buffer_id: self.id, seq: self.pushed_total }
     }
 }
 
@@ -124,30 +163,41 @@ pub type SenderEventBuffer = EventBuffer<crate::send::v2::SessionEvent>;
 
 /// Wraps a typestate that mints an externally-visible side effect (a payjoin
 /// URI, an HTTP request to a directory). The inner value is reachable only
-/// after the event that produced it is durable.
+/// after the event that produced it is durable in the same [`EventBuffer`]
+/// the `Provisional` was minted against.
 ///
-/// Created by transitions that want persist-before-expose semantics; consumed
-/// via [`Self::confirm`]. Holding a `Provisional<T>` across an `await` or
-/// across threads is fine — it's a plain value, not a borrow.
+/// `Provisional` is stamped with the buffer's [`BufferId`] and the seq number
+/// the producing event landed at. [`Self::confirm`] checks both: the buffer's
+/// id must match (so a confirm against a freshly-created or unrelated buffer
+/// is rejected even if its `committed_count` happens to be large enough), and
+/// the buffer's `committed_count` must have reached the recorded seq.
+///
+/// Holding a `Provisional<T>` across an `await` or across threads is fine —
+/// it's a plain value, not a borrow.
 #[derive(Debug)]
 pub struct Provisional<T> {
     inner: T,
-    needs_committed: u64,
+    stamp: EventStamp,
 }
 
 impl<T> Provisional<T> {
-    /// Crate-internal — transitions construct these.
-    ///
-    /// Currently used only by tests; receiver/sender transitions will call
-    /// this in follow-up PRs.
-    #[allow(dead_code)]
-    pub(crate) fn new(inner: T, needs_committed: u64) -> Self { Self { inner, needs_committed } }
+    /// Crate-internal — transitions construct these from the stamp returned
+    /// by [`EventBuffer::push`] on the buffer they pushed into.
+    pub(crate) fn new(inner: T, stamp: EventStamp) -> Self { Self { inner, stamp } }
 
-    /// Confirm once the required event is durable. On `Err`, returns `self`
-    /// so the caller can persist more and retry. Same shape as
-    /// [`std::sync::Arc::try_unwrap`].
+    /// Confirm once the producing event is durable in `buf`. On `Err`,
+    /// returns `self` so the caller can persist more and retry.
+    ///
+    /// Confirm fails (with `Err(self)`) if either:
+    /// - `buf`'s id does not match the buffer this `Provisional` was minted
+    ///   against (wrong-buffer attempt), or
+    /// - `buf.committed_count()` has not yet reached the seq number the
+    ///   producing event was assigned (not-yet-persisted).
     pub fn confirm<E>(self, buf: &EventBuffer<E>) -> Result<T, Self> {
-        if buf.committed_count() >= self.needs_committed {
+        if buf.id() != self.stamp.buffer_id {
+            return Err(self);
+        }
+        if buf.committed_count() >= self.stamp.seq {
             Ok(self.inner)
         } else {
             Err(self)
@@ -271,8 +321,9 @@ mod tests {
         assert_eq!(buf.committed_count(), 0);
         assert!(buf.is_empty());
 
-        let seq = buf.push("a");
-        assert_eq!(seq, 1);
+        let stamp = buf.push("a");
+        assert_eq!(stamp.seq, 1);
+        assert_eq!(stamp.buffer_id, buf.id());
         assert_eq!(buf.len(), 1);
         assert_eq!(buf.committed_count(), 0, "push alone does not commit");
 
@@ -313,8 +364,8 @@ mod tests {
     #[test]
     fn provisional_confirm_before_and_after_commit() {
         let mut buf: EventBuffer<&'static str> = EventBuffer::new();
-        let seq = buf.push("create");
-        let provisional = Provisional::new(42_u32, seq);
+        let stamp = buf.push("create");
+        let provisional = Provisional::new(42_u32, stamp);
 
         // Before commit: returns self.
         let provisional = match provisional.confirm(&buf) {
@@ -333,8 +384,8 @@ mod tests {
     #[test]
     fn provisional_retry_loop_pattern() {
         let mut buf: EventBuffer<&'static str> = EventBuffer::new();
-        let seq = buf.push("create");
-        let mut p = Provisional::new(42_u32, seq);
+        let stamp = buf.push("create");
+        let mut p = Provisional::new(42_u32, stamp);
 
         // Loop until confirm succeeds, persisting one event per iteration.
         let inner = loop {
@@ -360,8 +411,8 @@ mod tests {
     #[test]
     fn after_replay_then_push_continues_sequence() {
         let mut buf: EventBuffer<&'static str> = EventBuffer::after_replay(3);
-        let seq = buf.push("next");
-        assert_eq!(seq, 4, "seq numbers continue from replayed count");
+        let stamp = buf.push("next");
+        assert_eq!(stamp.seq, 4, "seq numbers continue from replayed count");
         assert_eq!(buf.committed_count(), 3);
 
         buf.commit(1);
@@ -371,11 +422,45 @@ mod tests {
     #[test]
     fn provisional_peek_inner_does_not_consume() {
         let mut buf: EventBuffer<&'static str> = EventBuffer::new();
-        let seq = buf.push("create");
-        let p = Provisional::new("hidden".to_string(), seq);
+        let stamp = buf.push("create");
+        let p = Provisional::new("hidden".to_string(), stamp);
 
         assert_eq!(p.peek_inner(), "hidden");
         assert_eq!(p.peek_inner(), "hidden");
+    }
+
+    /// Provisional rejects confirm against a freshly created buffer even if
+    /// that buffer's committed_count happens to reach the stamp's seq.
+    #[test]
+    fn provisional_confirm_against_fresh_buffer_is_rejected() {
+        let mut buf1: EventBuffer<&'static str> = EventBuffer::new();
+        let stamp = buf1.push("create");
+        let provisional = Provisional::new(42_u32, stamp);
+        buf1.commit(1);
+        // buf1 would confirm, but the user passes buf2 by mistake.
+        let buf2: EventBuffer<&'static str> = EventBuffer::new();
+        assert!(provisional.confirm(&buf2).is_err());
+    }
+
+    /// Provisional rejects confirm against an unrelated buffer with a
+    /// coincidentally-matching committed_count. Without buffer-id witness
+    /// this was the silently-accepts case that defeated the gate.
+    #[test]
+    fn provisional_confirm_against_unrelated_buffer_with_same_seq_is_rejected() {
+        let mut buf_a: EventBuffer<&'static str> = EventBuffer::new();
+        let stamp = buf_a.push("gate");
+        let provisional = Provisional::new(99_u32, stamp);
+        // buf_a is dropped without draining — the gate event was never persisted.
+        drop(buf_a);
+
+        // A different buffer happens to have one committed event.
+        let mut buf_b: EventBuffer<&'static str> = EventBuffer::new();
+        buf_b.push("unrelated");
+        buf_b.commit(1);
+        assert_eq!(buf_b.committed_count(), 1);
+
+        // Even though the seq counts line up, the buffer ids do not.
+        assert!(provisional.confirm(&buf_b).is_err());
     }
 
     /// Demonstrates that an arbitrary drain loop — sync or async — works

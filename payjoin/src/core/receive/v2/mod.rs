@@ -415,8 +415,8 @@ impl ReceiverBuilder {
     /// Caller drains `buf` through their storage of choice, then calls
     /// [`Provisional::confirm`] to unlock the receiver.
     pub fn build(self, buf: &mut EventBuffer<SessionEvent>) -> Provisional<Receiver<Initialized>> {
-        let seq = buf.push(SessionEvent::Created(self.0.clone()));
-        Provisional::new(Receiver { state: Initialized {}, session_context: self.0 }, seq)
+        let stamp = buf.push(SessionEvent::Created(self.0.clone()));
+        Provisional::new(Receiver { state: Initialized {}, session_context: self.0 }, stamp)
     }
 }
 
