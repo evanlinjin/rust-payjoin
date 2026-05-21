@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::{ReceiveSession, SessionContext};
 use crate::error::{InternalReplayError, ReplayError};
 use crate::output_substitution::OutputSubstitution;
-use crate::persist::{AsyncSessionPersister, SessionPersister};
+use crate::persist::SessionPersister;
 use crate::receive::{InputPair, JsonReply, OriginalPayload, PsbtContext};
 use crate::{ImplementationError, PjUri};
 
@@ -53,34 +53,6 @@ where
         Ok(r) => r,
         Err(e) => {
             persister.close().map_err(|ce| {
-                InternalReplayError::PersistenceFailure(ImplementationError::new(ce))
-            })?;
-            return Err(e);
-        }
-    };
-
-    let history = construct_history(session_events)?;
-    Ok((receiver, history))
-}
-
-/// Async version of [replay_event_log]
-pub async fn replay_event_log_async<P>(
-    persister: &P,
-) -> Result<(ReceiveSession, SessionHistory), ReplayError<ReceiveSession, SessionEvent>>
-where
-    P: AsyncSessionPersister,
-    P::SessionEvent: Into<SessionEvent> + Clone,
-    P::SessionEvent: From<SessionEvent>,
-{
-    let logs = persister
-        .load()
-        .await
-        .map_err(|e| InternalReplayError::PersistenceFailure(ImplementationError::new(e)))?;
-
-    let (receiver, session_events) = match replay_events(logs.map(|e| e.into())) {
-        Ok(r) => r,
-        Err(e) => {
-            persister.close().await.map_err(|ce| {
                 InternalReplayError::PersistenceFailure(ImplementationError::new(ce))
             })?;
             return Err(e);
@@ -225,7 +197,7 @@ mod tests {
     use payjoin_test_utils::{BoxError, EXAMPLE_URL};
 
     use super::*;
-    use crate::persist::{InMemoryAsyncPersister, InMemoryPersister};
+    use crate::persist::InMemoryPersister;
     use crate::receive::tests::original_from_test_vector;
     use crate::receive::v2::test::{mock_err, SHARED_CONTEXT};
     use crate::receive::v2::{
@@ -346,14 +318,6 @@ mod tests {
         verify_session_result(replay_event_log(&persister), test);
     }
 
-    async fn run_session_history_test_async(test: &SessionHistoryTest) {
-        let persister = InMemoryAsyncPersister::<SessionEvent>::default();
-        for event in test.events.clone() {
-            persister.save_event(event).await.expect("In memory persister shouldn't fail");
-        }
-        verify_session_result(replay_event_log_async(&persister).await, test);
-    }
-
     #[tokio::test]
     async fn test_replaying_session_creation() {
         let session_context = SHARED_CONTEXT.clone();
@@ -369,7 +333,6 @@ mod tests {
             }),
         };
         run_session_history_test(&test);
-        run_session_history_test_async(&test).await;
     }
 
     #[tokio::test]
@@ -379,19 +342,9 @@ mod tests {
 
         let persister = InMemoryPersister::<SessionEvent>::default();
         persister
-            .save_event(SessionEvent::Created(session_context.clone()))
+            .save_event(SessionEvent::Created(session_context))
             .expect("in memory persister save should not fail");
         let err = replay_event_log(&persister).expect_err("session should be expired");
-        let expected_err: ReplayError<ReceiveSession, SessionEvent> =
-            InternalReplayError::Expired(expiration).into();
-        assert_eq!(err.to_string(), expected_err.to_string());
-
-        let persister = InMemoryAsyncPersister::<SessionEvent>::default();
-        persister
-            .save_event(SessionEvent::Created(session_context))
-            .await
-            .expect("in memory async persister save should not fail");
-        let err = replay_event_log_async(&persister).await.expect_err("session should be expired");
         let expected_err: ReplayError<ReceiveSession, SessionEvent> =
             InternalReplayError::Expired(expiration).into();
         assert_eq!(err.to_string(), expected_err.to_string());
@@ -413,23 +366,6 @@ mod tests {
             .into();
         assert_eq!(err.to_string(), expected_err.to_string());
         assert!(persister.inner.read().expect("lock should not be poisoned").is_closed);
-
-        let persister = InMemoryAsyncPersister::<SessionEvent>::default();
-        persister
-            .save_event(SessionEvent::CheckedBroadcastSuitability())
-            .await
-            .expect("in memory async persister save should not fail");
-        assert!(!persister.inner.read().await.is_closed);
-        let err =
-            replay_event_log_async(&persister).await.expect_err("session replay should be fail");
-        let expected_err: ReplayError<ReceiveSession, SessionEvent> =
-            InternalReplayError::InvalidEvent(
-                Box::new(SessionEvent::CheckedBroadcastSuitability()),
-                None,
-            )
-            .into();
-        assert_eq!(err.to_string(), expected_err.to_string());
-        assert!(persister.inner.read().await.is_closed);
     }
 
     #[tokio::test]
@@ -456,7 +392,6 @@ mod tests {
             }),
         };
         run_session_history_test(&test);
-        run_session_history_test_async(&test).await;
     }
 
     #[tokio::test]
@@ -483,7 +418,6 @@ mod tests {
             }),
         };
         run_session_history_test(&test);
-        run_session_history_test_async(&test).await;
     }
 
     #[tokio::test]
@@ -518,7 +452,6 @@ mod tests {
             }),
         };
         run_session_history_test(&test);
-        run_session_history_test_async(&test).await;
     }
 
     #[tokio::test]
@@ -592,7 +525,6 @@ mod tests {
             }),
         };
         run_session_history_test(&test);
-        run_session_history_test_async(&test).await;
     }
 
     #[tokio::test]
@@ -668,7 +600,6 @@ mod tests {
             expected_receiver_state: ReceiveSession::Closed(SessionOutcome::Success(vec![])),
         };
         run_session_history_test(&test);
-        run_session_history_test_async(&test).await;
     }
 
     #[tokio::test]
@@ -705,7 +636,6 @@ mod tests {
             expected_receiver_state: ReceiveSession::Closed(SessionOutcome::Failure),
         };
         run_session_history_test(&test);
-        run_session_history_test_async(&test).await;
     }
 
     #[tokio::test]
@@ -743,7 +673,6 @@ mod tests {
             }),
         };
         run_session_history_test(&test);
-        run_session_history_test_async(&test).await;
     }
 
     #[test]
