@@ -246,40 +246,38 @@ mod tests {
 
         let original = original_from_test_vector();
         let unchecked_proposal = unchecked_receiver_from_test_vector();
-        let maybe_inputs_owned = unchecked_proposal
-            .clone()
-            .assume_interactive_receiver()
-            .save(&persister)
-            .expect("Save should not fail");
+        let mut buf = crate::persist::EventBuffer::new();
+        let maybe_inputs_owned = unchecked_proposal.clone().assume_interactive_receiver(&mut buf);
+        persister.drain(&mut buf).expect("drain should not fail");
         let maybe_inputs_seen = maybe_inputs_owned
             .clone()
-            .check_inputs_not_owned(&mut |_| Ok(false))
-            .save(&persister)
+            .check_inputs_not_owned(&mut |_| Ok(false), &mut buf)
             .expect("No inputs should be owned");
+        persister.drain(&mut buf).expect("drain");
         let outputs_unknown = maybe_inputs_seen
             .clone()
-            .check_no_inputs_seen_before(&mut |_| Ok(false))
-            .save(&persister)
+            .check_no_inputs_seen_before(&mut |_| Ok(false), &mut buf)
             .expect("No inputs should be seen before");
+        persister.drain(&mut buf).expect("drain");
         let wants_outputs = outputs_unknown
             .clone()
-            .identify_receiver_outputs(&mut |_| Ok(true))
-            .save(&persister)
+            .identify_receiver_outputs(&mut |_| Ok(true), &mut buf)
             .expect("Outputs should be identified");
-        let wants_inputs =
-            wants_outputs.clone().commit_outputs().save(&persister).expect("Save should not fail");
-        let wants_fee_range =
-            wants_inputs.clone().commit_inputs().save(&persister).expect("Save should not fail");
+        persister.drain(&mut buf).expect("drain");
+        let wants_inputs = wants_outputs.clone().commit_outputs(&mut buf);
+        persister.drain(&mut buf).expect("drain");
+        let wants_fee_range = wants_inputs.clone().commit_inputs(&mut buf);
+        persister.drain(&mut buf).expect("drain");
         let provisional_proposal = wants_fee_range
             .clone()
-            .apply_fee_range(None, None)
-            .save(&persister)
-            .expect("Save should not fail");
+            .apply_fee_range(None, None, &mut buf)
+            .expect("apply_fee_range should not fail");
+        persister.drain(&mut buf).expect("drain");
         let payjoin_proposal = provisional_proposal
             .clone()
-            .finalize_proposal(|psbt| Ok(psbt.clone()))
-            .save(&persister)
+            .finalize_proposal(|psbt| Ok(psbt.clone()), &mut buf)
             .expect("Payjoin proposal should be finalized");
+        persister.drain(&mut buf).expect("drain");
 
         let test_cases = vec![
             SessionEvent::Created(SHARED_CONTEXT.clone()),
@@ -494,10 +492,10 @@ mod tests {
         let session_context = SHARED_CONTEXT.clone();
         let mut events = vec![];
         let original = original_from_test_vector();
-        let maybe_inputs_owned = unchecked_receiver_from_test_vector()
-            .assume_interactive_receiver()
-            .save(&persister)
-            .unwrap();
+        let mut buf = crate::persist::EventBuffer::new();
+        let maybe_inputs_owned =
+            unchecked_receiver_from_test_vector().assume_interactive_receiver(&mut buf);
+        persister.drain(&mut buf).unwrap();
         let expected_fallback = maybe_inputs_owned.extract_tx_to_schedule_broadcast();
         let reply_key = Some(crate::HpkeKeyPair::gen_keypair().1);
 
@@ -530,34 +528,34 @@ mod tests {
         let mut events = vec![];
 
         let original = original_from_test_vector();
-        let maybe_inputs_owned = unchecked_receiver_from_test_vector()
-            .assume_interactive_receiver()
-            .save(&persister)
-            .unwrap();
+        let mut buf = crate::persist::EventBuffer::new();
+        let maybe_inputs_owned =
+            unchecked_receiver_from_test_vector().assume_interactive_receiver(&mut buf);
+        persister.drain(&mut buf).unwrap();
         let maybe_inputs_seen = maybe_inputs_owned
             .clone()
-            .check_inputs_not_owned(&mut |_| Ok(false))
-            .save(&persister)
+            .check_inputs_not_owned(&mut |_| Ok(false), &mut buf)
             .expect("No inputs should be owned");
+        persister.drain(&mut buf).expect("drain");
         let outputs_unknown = maybe_inputs_seen
             .clone()
-            .check_no_inputs_seen_before(&mut |_| Ok(false))
-            .save(&persister)
+            .check_no_inputs_seen_before(&mut |_| Ok(false), &mut buf)
             .expect("No inputs should be seen before");
+        persister.drain(&mut buf).expect("drain");
         let wants_outputs = outputs_unknown
             .clone()
-            .identify_receiver_outputs(&mut |_| Ok(true))
-            .save(&persister)
+            .identify_receiver_outputs(&mut |_| Ok(true), &mut buf)
             .expect("Outputs should be identified");
-        let wants_inputs =
-            wants_outputs.clone().commit_outputs().save(&persister).expect("Save should not fail");
-        let wants_fee_range =
-            wants_inputs.clone().commit_inputs().save(&persister).expect("Save should not fail");
+        persister.drain(&mut buf).expect("drain");
+        let wants_inputs = wants_outputs.clone().commit_outputs(&mut buf);
+        persister.drain(&mut buf).expect("drain");
+        let wants_fee_range = wants_inputs.clone().commit_inputs(&mut buf);
+        persister.drain(&mut buf).expect("drain");
         let provisional_proposal = wants_fee_range
             .clone()
-            .apply_fee_range(None, None)
-            .save(&persister)
+            .apply_fee_range(None, None, &mut buf)
             .expect("Contributed inputs should be valid");
+        persister.drain(&mut buf).expect("drain");
         let expected_fallback = maybe_inputs_owned.extract_tx_to_schedule_broadcast();
         let reply_key = Some(crate::HpkeKeyPair::gen_keypair().1);
 
@@ -604,39 +602,39 @@ mod tests {
         let mut events = vec![];
 
         let original = original_from_test_vector();
-        let maybe_inputs_owned = unchecked_receiver_from_test_vector()
-            .assume_interactive_receiver()
-            .save(&persister)
-            .unwrap();
+        let mut buf = crate::persist::EventBuffer::new();
+        let maybe_inputs_owned =
+            unchecked_receiver_from_test_vector().assume_interactive_receiver(&mut buf);
+        persister.drain(&mut buf).unwrap();
         let maybe_inputs_seen = maybe_inputs_owned
             .clone()
-            .check_inputs_not_owned(&mut |_| Ok(false))
-            .save(&persister)
+            .check_inputs_not_owned(&mut |_| Ok(false), &mut buf)
             .expect("No inputs should be owned");
+        persister.drain(&mut buf).expect("drain");
         let outputs_unknown = maybe_inputs_seen
             .clone()
-            .check_no_inputs_seen_before(&mut |_| Ok(false))
-            .save(&persister)
+            .check_no_inputs_seen_before(&mut |_| Ok(false), &mut buf)
             .expect("No inputs should be seen before");
+        persister.drain(&mut buf).expect("drain");
         let wants_outputs = outputs_unknown
             .clone()
-            .identify_receiver_outputs(&mut |_| Ok(true))
-            .save(&persister)
+            .identify_receiver_outputs(&mut |_| Ok(true), &mut buf)
             .expect("Outputs should be identified");
-        let wants_inputs =
-            wants_outputs.clone().commit_outputs().save(&persister).expect("Save should not fail");
-        let wants_fee_range =
-            wants_inputs.clone().commit_inputs().save(&persister).expect("Save should not fail");
+        persister.drain(&mut buf).expect("drain");
+        let wants_inputs = wants_outputs.clone().commit_outputs(&mut buf);
+        persister.drain(&mut buf).expect("drain");
+        let wants_fee_range = wants_inputs.clone().commit_inputs(&mut buf);
+        persister.drain(&mut buf).expect("drain");
         let provisional_proposal = wants_fee_range
             .clone()
-            .apply_fee_range(None, None)
-            .save(&persister)
+            .apply_fee_range(None, None, &mut buf)
             .expect("Contributed inputs should be valid");
+        persister.drain(&mut buf).expect("drain");
         let payjoin_proposal = provisional_proposal
             .clone()
-            .finalize_proposal(|psbt| Ok(psbt.clone()))
-            .save(&persister)
+            .finalize_proposal(|psbt| Ok(psbt.clone()), &mut buf)
             .expect("Payjoin proposal should be finalized");
+        persister.drain(&mut buf).expect("drain");
         let expected_fallback = maybe_inputs_owned.extract_tx_to_schedule_broadcast();
         let reply_key = Some(crate::HpkeKeyPair::gen_keypair().1);
 

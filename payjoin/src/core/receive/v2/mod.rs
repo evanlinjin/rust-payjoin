@@ -53,11 +53,7 @@ use crate::ohttp::{
     ohttp_encapsulate, process_get_res, process_post_res, OhttpEncapsulationError, OhttpKeys,
 };
 use crate::output_substitution::OutputSubstitution;
-use crate::persist::{
-    ApiError, EventBuffer, MaybeFatalOrSuccessTransition, MaybeFatalTransition,
-    MaybeSuccessTransition, MaybeTransientTransition, NextStateTransition,
-    OptionalTransitionOutcome, Provisional,
-};
+use crate::persist::{ApiError, EventBuffer, OptionalTransitionOutcome, Provisional};
 use crate::receive::{
     check_references, parse_payload, InputOwnedTag, InputPair, InputSeenTag, OriginalPayload,
     OutputOwnedTag, PsbtContext, Reference, TaggedReference,
@@ -657,14 +653,13 @@ impl Receiver<UncheckedOriginalPayload> {
     /// receiver needs to manually create payjoin URIs.
     pub fn assume_interactive_receiver(
         self,
-    ) -> NextStateTransition<SessionEvent, Receiver<MaybeInputsOwned>> {
-        NextStateTransition::success(
-            SessionEvent::CheckedBroadcastSuitability(),
-            Receiver {
-                state: MaybeInputsOwned { original: self.original.clone() },
-                session_context: self.session_context,
-            },
-        )
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Receiver<MaybeInputsOwned> {
+        buf.push(SessionEvent::CheckedBroadcastSuitability());
+        Receiver {
+            state: MaybeInputsOwned { original: self.original.clone() },
+            session_context: self.session_context,
+        }
     }
 
     /// Extracts the original PSBT so caller can check that the proposal can be broadcasted.
@@ -760,29 +755,29 @@ impl Receiver<MaybeInputsOwned> {
     pub fn check_inputs_not_owned(
         self,
         is_owned: &mut impl FnMut(&Script) -> Result<bool, ImplementationError>,
-    ) -> MaybeFatalTransition<
-        SessionEvent,
-        Receiver<MaybeInputsSeen>,
-        Error,
-        Receiver<HasReplyableError>,
-    > {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Receiver<MaybeInputsSeen>, ApiError<Error, Receiver<HasReplyableError>>> {
         match self.get_input_script_refs() {
             Ok(input_scripts) => match check_references(input_scripts, &mut |script: &ScriptBuf| {
                 is_owned(script.as_script())
             }) {
-                Ok(checked_input_scripts) => self.apply_input_owned_checks(checked_input_scripts),
-                Err(e) => MaybeFatalTransition::transient(e.into()),
+                Ok(checked_input_scripts) =>
+                    self.apply_input_owned_checks(checked_input_scripts, buf),
+                Err(e) => Err(ApiError::Transient(e.into())),
             },
             Err(e) => match e {
-                Error::Implementation(_) => MaybeFatalTransition::transient(e),
-                _ => MaybeFatalTransition::replyable_error(
-                    SessionEvent::GotReplyableError((&e).into()),
-                    Receiver {
-                        state: HasReplyableError { error_reply: (&e).into() },
-                        session_context: self.session_context,
-                    },
-                    e,
-                ),
+                Error::Implementation(_) => Err(ApiError::Transient(e)),
+                _ => {
+                    let error_reply: JsonReply = (&e).into();
+                    buf.push(SessionEvent::GotReplyableError(error_reply.clone()));
+                    Err(ApiError::FatalWithState(
+                        e,
+                        Receiver {
+                            state: HasReplyableError { error_reply },
+                            session_context: self.session_context,
+                        },
+                    ))
+                }
             },
         }
     }
@@ -808,30 +803,29 @@ impl Receiver<MaybeInputsOwned> {
     pub fn apply_input_owned_checks(
         self,
         checked_input_scripts: impl IntoIterator<Item = TaggedReference<ScriptBuf, InputOwnedTag>>,
-    ) -> MaybeFatalTransition<
-        SessionEvent,
-        Receiver<MaybeInputsSeen>,
-        Error,
-        Receiver<HasReplyableError>,
-    > {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Receiver<MaybeInputsSeen>, ApiError<Error, Receiver<HasReplyableError>>> {
         match self.state.original.apply_input_owned_checks(checked_input_scripts) {
-            Ok(()) => MaybeFatalTransition::success(
-                SessionEvent::CheckedInputsNotOwned(),
-                Receiver {
+            Ok(()) => {
+                buf.push(SessionEvent::CheckedInputsNotOwned());
+                Ok(Receiver {
                     state: MaybeInputsSeen { original: self.original.clone() },
                     session_context: self.session_context,
-                },
-            ),
+                })
+            }
             Err(e) => match e {
-                Error::Implementation(_) => MaybeFatalTransition::transient(e),
-                _ => MaybeFatalTransition::replyable_error(
-                    SessionEvent::GotReplyableError((&e).into()),
-                    Receiver {
-                        state: HasReplyableError { error_reply: (&e).into() },
-                        session_context: self.session_context,
-                    },
-                    e,
-                ),
+                Error::Implementation(_) => Err(ApiError::Transient(e)),
+                _ => {
+                    let error_reply: JsonReply = (&e).into();
+                    buf.push(SessionEvent::GotReplyableError(error_reply.clone()));
+                    Err(ApiError::FatalWithState(
+                        e,
+                        Receiver {
+                            state: HasReplyableError { error_reply },
+                            session_context: self.session_context,
+                        },
+                    ))
+                }
             },
         }
     }
@@ -865,15 +859,12 @@ impl Receiver<MaybeInputsSeen> {
     pub fn check_no_inputs_seen_before(
         self,
         is_known: &mut impl FnMut(&OutPoint) -> Result<bool, ImplementationError>,
-    ) -> MaybeFatalTransition<
-        SessionEvent,
-        Receiver<OutputsUnknown>,
-        Error,
-        Receiver<HasReplyableError>,
-    > {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Receiver<OutputsUnknown>, ApiError<Error, Receiver<HasReplyableError>>> {
         match check_references(self.get_input_outpoint_refs(), is_known) {
-            Ok(checked_input_outpoints) => self.apply_input_seen_checks(checked_input_outpoints),
-            Err(e) => MaybeFatalTransition::transient(e.into()),
+            Ok(checked_input_outpoints) =>
+                self.apply_input_seen_checks(checked_input_outpoints, buf),
+            Err(e) => Err(ApiError::Transient(e.into())),
         }
     }
 
@@ -908,30 +899,29 @@ impl Receiver<MaybeInputsSeen> {
     pub fn apply_input_seen_checks(
         self,
         checked_input_outpoints: impl IntoIterator<Item = TaggedReference<OutPoint, InputSeenTag>>,
-    ) -> MaybeFatalTransition<
-        SessionEvent,
-        Receiver<OutputsUnknown>,
-        Error,
-        Receiver<HasReplyableError>,
-    > {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Receiver<OutputsUnknown>, ApiError<Error, Receiver<HasReplyableError>>> {
         match self.state.original.apply_input_seen_checks(checked_input_outpoints) {
-            Ok(()) => MaybeFatalTransition::success(
-                SessionEvent::CheckedNoInputsSeenBefore(),
-                Receiver {
+            Ok(()) => {
+                buf.push(SessionEvent::CheckedNoInputsSeenBefore());
+                Ok(Receiver {
                     state: OutputsUnknown { original: self.original.clone() },
                     session_context: self.session_context,
-                },
-            ),
+                })
+            }
             Err(e) => match e {
-                Error::Implementation(_) => MaybeFatalTransition::transient(e),
-                _ => MaybeFatalTransition::replyable_error(
-                    SessionEvent::GotReplyableError((&e).into()),
-                    Receiver {
-                        state: HasReplyableError { error_reply: (&e).into() },
-                        session_context: self.session_context,
-                    },
-                    e,
-                ),
+                Error::Implementation(_) => Err(ApiError::Transient(e)),
+                _ => {
+                    let error_reply: JsonReply = (&e).into();
+                    buf.push(SessionEvent::GotReplyableError(error_reply.clone()));
+                    Err(ApiError::FatalWithState(
+                        e,
+                        Receiver {
+                            state: HasReplyableError { error_reply },
+                            session_context: self.session_context,
+                        },
+                    ))
+                }
             },
         }
     }
@@ -970,17 +960,14 @@ impl Receiver<OutputsUnknown> {
     pub fn identify_receiver_outputs(
         self,
         is_receiver_output: &mut impl FnMut(&Script) -> Result<bool, ImplementationError>,
-    ) -> MaybeFatalTransition<
-        SessionEvent,
-        Receiver<WantsOutputs>,
-        Error,
-        Receiver<HasReplyableError>,
-    > {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Receiver<WantsOutputs>, ApiError<Error, Receiver<HasReplyableError>>> {
         match check_references(self.get_output_script_refs(), &mut |script: &ScriptBuf| {
             is_receiver_output(script.as_script())
         }) {
-            Ok(checked_output_scripts) => self.apply_output_owned_checks(checked_output_scripts),
-            Err(e) => MaybeFatalTransition::transient(e.into()),
+            Ok(checked_output_scripts) =>
+                self.apply_output_owned_checks(checked_output_scripts, buf),
+            Err(e) => Err(ApiError::Transient(e.into())),
         }
     }
 
@@ -1018,27 +1005,29 @@ impl Receiver<OutputsUnknown> {
     pub fn apply_output_owned_checks(
         self,
         checked_output_scripts: impl IntoIterator<Item = TaggedReference<ScriptBuf, OutputOwnedTag>>,
-    ) -> MaybeFatalTransition<
-        SessionEvent,
-        Receiver<WantsOutputs>,
-        Error,
-        Receiver<HasReplyableError>,
-    > {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Receiver<WantsOutputs>, ApiError<Error, Receiver<HasReplyableError>>> {
         match self.state.original.apply_output_owned_checks(checked_output_scripts) {
-            Ok(inner) => MaybeFatalTransition::success(
-                SessionEvent::IdentifiedReceiverOutputs(inner.owned_vouts.clone()),
-                Receiver { state: WantsOutputs { inner }, session_context: self.session_context },
-            ),
+            Ok(inner) => {
+                buf.push(SessionEvent::IdentifiedReceiverOutputs(inner.owned_vouts.clone()));
+                Ok(Receiver {
+                    state: WantsOutputs { inner },
+                    session_context: self.session_context,
+                })
+            }
             Err(e) => match e {
-                Error::Implementation(_) => MaybeFatalTransition::transient(e),
-                _ => MaybeFatalTransition::replyable_error(
-                    SessionEvent::GotReplyableError((&e).into()),
-                    Receiver {
-                        state: HasReplyableError { error_reply: (&e).into() },
-                        session_context: self.session_context,
-                    },
-                    e,
-                ),
+                Error::Implementation(_) => Err(ApiError::Transient(e)),
+                _ => {
+                    let error_reply: JsonReply = (&e).into();
+                    buf.push(SessionEvent::GotReplyableError(error_reply.clone()));
+                    Err(ApiError::FatalWithState(
+                        e,
+                        Receiver {
+                            state: HasReplyableError { error_reply },
+                            session_context: self.session_context,
+                        },
+                    ))
+                }
             },
         }
     }
@@ -1105,12 +1094,10 @@ impl Receiver<WantsOutputs> {
     /// Commits the outputs as final, and moves on to the next typestate.
     ///
     /// Outputs cannot be modified after this function is called.
-    pub fn commit_outputs(self) -> NextStateTransition<SessionEvent, Receiver<WantsInputs>> {
+    pub fn commit_outputs(self, buf: &mut EventBuffer<SessionEvent>) -> Receiver<WantsInputs> {
         let inner = self.state.inner.clone().commit_outputs();
-        NextStateTransition::success(
-            SessionEvent::CommittedOutputs(self.state.inner.payjoin_psbt.unsigned_tx.output),
-            Receiver { state: WantsInputs { inner }, session_context: self.session_context },
-        )
+        buf.push(SessionEvent::CommittedOutputs(self.state.inner.payjoin_psbt.unsigned_tx.output));
+        Receiver { state: WantsInputs { inner }, session_context: self.session_context }
     }
 
     pub(crate) fn apply_committed_outputs(self, outputs: Vec<TxOut>) -> ReceiveSession {
@@ -1166,12 +1153,10 @@ impl Receiver<WantsInputs> {
     /// Commits the inputs as final, and moves on to the next typestate.
     ///
     /// Inputs cannot be modified after this function is called.
-    pub fn commit_inputs(self) -> NextStateTransition<SessionEvent, Receiver<WantsFeeRange>> {
+    pub fn commit_inputs(self, buf: &mut EventBuffer<SessionEvent>) -> Receiver<WantsFeeRange> {
         let inner = self.state.inner.clone().commit_inputs();
-        NextStateTransition::success(
-            SessionEvent::CommittedInputs(inner.receiver_inputs.clone()),
-            Receiver { state: WantsFeeRange { inner }, session_context: self.session_context },
-        )
+        buf.push(SessionEvent::CommittedInputs(inner.receiver_inputs.clone()));
+        Receiver { state: WantsFeeRange { inner }, session_context: self.session_context }
     }
 
     pub(crate) fn apply_committed_inputs(
@@ -1221,7 +1206,8 @@ impl Receiver<WantsFeeRange> {
         self,
         min_fee_rate: Option<FeeRate>,
         max_effective_fee_rate: Option<FeeRate>,
-    ) -> MaybeFatalTransition<SessionEvent, Receiver<ProvisionalProposal>, ProtocolError> {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Receiver<ProvisionalProposal>, ApiError<ProtocolError>> {
         let max_effective_fee_rate =
             max_effective_fee_rate.or(Some(self.session_context.max_fee_rate));
         match self
@@ -1229,14 +1215,14 @@ impl Receiver<WantsFeeRange> {
             .inner
             .calculate_psbt_context_with_fee_range(min_fee_rate, max_effective_fee_rate)
         {
-            Ok(psbt_context) => MaybeFatalTransition::success(
-                SessionEvent::AppliedFeeRange(psbt_context.clone()),
-                Receiver {
+            Ok(psbt_context) => {
+                buf.push(SessionEvent::AppliedFeeRange(psbt_context.clone()));
+                Ok(Receiver {
                     state: ProvisionalProposal { psbt_context },
                     session_context: self.session_context,
-                },
-            ),
-            Err(e) => MaybeFatalTransition::transient(ProtocolError::OriginalPayload(e.into())),
+                })
+            }
+            Err(e) => Err(ApiError::Transient(ProtocolError::OriginalPayload(e.into()))),
         }
     }
 
@@ -1269,13 +1255,13 @@ impl Receiver<ProvisionalProposal> {
     pub fn finalize_proposal(
         self,
         wallet_process_psbt: impl Fn(&Psbt) -> Result<Psbt, ImplementationError>,
-    ) -> MaybeTransientTransition<SessionEvent, Receiver<PayjoinProposal>, ImplementationError>
-    {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Receiver<PayjoinProposal>, ApiError<ImplementationError>> {
         let psbt = self.psbt_to_sign();
         let signed_psbt = wallet_process_psbt(&psbt);
         match signed_psbt {
-            Ok(signed_psbt) => self.finalize_signed_proposal(&signed_psbt),
-            Err(e) => MaybeTransientTransition::transient(e),
+            Ok(signed_psbt) => self.finalize_signed_proposal(&signed_psbt, buf),
+            Err(e) => Err(ApiError::Transient(e)),
         }
     }
 
@@ -1295,22 +1281,18 @@ impl Receiver<ProvisionalProposal> {
     pub fn finalize_signed_proposal(
         self,
         signed_psbt: &Psbt,
-    ) -> MaybeTransientTransition<SessionEvent, Receiver<PayjoinProposal>, ImplementationError>
-    {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Receiver<PayjoinProposal>, ApiError<ImplementationError>> {
         let original_psbt = self.state.psbt_context.original_psbt.clone();
         let payjoin_psbt =
             match self.state.psbt_context.finalize_signed_proposal(signed_psbt.clone()) {
                 Ok(payjoin_psbt) => payjoin_psbt,
-                Err(e) => {
-                    return MaybeTransientTransition::transient(e);
-                }
+                Err(e) => return Err(ApiError::Transient(e)),
             };
         let psbt_context = PsbtContext { payjoin_psbt: payjoin_psbt.clone(), original_psbt };
         let payjoin_proposal = PayjoinProposal { psbt_context: psbt_context.clone() };
-        MaybeTransientTransition::success(
-            SessionEvent::FinalizedProposal(payjoin_psbt),
-            Receiver { state: payjoin_proposal, session_context: self.session_context },
-        )
+        buf.push(SessionEvent::FinalizedProposal(payjoin_psbt));
+        Ok(Receiver { state: payjoin_proposal, session_context: self.session_context })
     }
 
     pub(crate) fn apply_payjoin_proposal(self, payjoin_psbt: Psbt) -> ReceiveSession {
@@ -1390,25 +1372,26 @@ impl Receiver<PayjoinProposal> {
         self,
         res: &[u8],
         ohttp_context: ohttp::ClientResponse,
-    ) -> MaybeFatalTransition<SessionEvent, Receiver<Monitor>, ProtocolError> {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<Receiver<Monitor>, ApiError<ProtocolError>> {
         match process_post_res(res, ohttp_context) {
-            Ok(_) => MaybeFatalTransition::success(
-                SessionEvent::PostedPayjoinProposal(),
-                Receiver {
+            Ok(_) => {
+                buf.push(SessionEvent::PostedPayjoinProposal());
+                Ok(Receiver {
                     state: Monitor { psbt_context: self.state.psbt_context.clone() },
                     session_context: self.session_context.clone(),
-                },
-            ),
+                })
+            }
             Err(e) =>
                 if e.is_fatal() {
-                    MaybeFatalTransition::fatal(
-                        SessionEvent::Closed(SessionOutcome::Failure),
-                        ProtocolError::V2(InternalSessionError::DirectoryResponse(e).into()),
-                    )
-                } else {
-                    MaybeFatalTransition::transient(ProtocolError::V2(
+                    buf.push(SessionEvent::Closed(SessionOutcome::Failure));
+                    Err(ApiError::Fatal(ProtocolError::V2(
                         InternalSessionError::DirectoryResponse(e).into(),
-                    ))
+                    )))
+                } else {
+                    Err(ApiError::Transient(ProtocolError::V2(
+                        InternalSessionError::DirectoryResponse(e).into(),
+                    )))
                 },
         }
     }
@@ -1467,20 +1450,23 @@ impl Receiver<HasReplyableError> {
         &self,
         res: &[u8],
         ohttp_context: ohttp::ClientResponse,
-    ) -> MaybeSuccessTransition<SessionEvent, (), ProtocolError> {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<(), ApiError<ProtocolError>> {
         match process_post_res(res, ohttp_context) {
-            Ok(_) =>
-                MaybeSuccessTransition::success(SessionEvent::Closed(SessionOutcome::Failure), ()),
+            Ok(_) => {
+                buf.push(SessionEvent::Closed(SessionOutcome::Failure));
+                Ok(())
+            }
             Err(e) =>
                 if e.is_fatal() {
-                    MaybeSuccessTransition::fatal(
-                        SessionEvent::Closed(SessionOutcome::Failure),
-                        ProtocolError::V2(InternalSessionError::DirectoryResponse(e).into()),
-                    )
-                } else {
-                    MaybeSuccessTransition::transient(ProtocolError::V2(
+                    buf.push(SessionEvent::Closed(SessionOutcome::Failure));
+                    Err(ApiError::Fatal(ProtocolError::V2(
                         InternalSessionError::DirectoryResponse(e).into(),
-                    ))
+                    )))
+                } else {
+                    Err(ApiError::Transient(ProtocolError::V2(
+                        InternalSessionError::DirectoryResponse(e).into(),
+                    )))
                 },
         }
     }
@@ -1517,7 +1503,8 @@ impl Receiver<Monitor> {
     pub fn check_payment(
         &self,
         transaction_exists: impl Fn(Txid) -> Result<Option<bitcoin::Transaction>, ImplementationError>,
-    ) -> MaybeFatalOrSuccessTransition<SessionEvent, Self, Error> {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<OptionalTransitionOutcome<(), Self>, ApiError<Error>> {
         let fallback_tx = self
             .state
             .psbt_context
@@ -1530,9 +1517,8 @@ impl Receiver<Monitor> {
         // the Payjoin proposal is going to change when the sender signs their non-SegWit address
         // one more time. The receiver cannot monitor the transaction, and should conclude the session.
         if has_empty_witness(&fallback_tx) {
-            return MaybeFatalOrSuccessTransition::success(SessionEvent::Closed(
-                SessionOutcome::PayjoinProposalSent,
-            ));
+            buf.push(SessionEvent::Closed(SessionOutcome::PayjoinProposalSent));
+            return Ok(OptionalTransitionOutcome::Progress(()));
         }
 
         let payjoin_proposal = &self.state.psbt_context.payjoin_psbt;
@@ -1544,25 +1530,25 @@ impl Receiver<Monitor> {
             Ok(Some(tx)) => {
                 let tx_id = tx.compute_txid();
                 if tx_id != payjoin_txid {
-                    return MaybeFatalOrSuccessTransition::transient(Error::Implementation(
+                    return Err(ApiError::Transient(Error::Implementation(
                         ImplementationError::from(format!("Payjoin transaction ID mismatch. Expected: {payjoin_txid}, Got: {tx_id}").as_str()),
-                    ));
+                    )));
                 }
-                return self.payjoin_tx_exists(tx);
+                return self.payjoin_tx_exists(tx, buf);
             }
             Ok(None) => {}
-            Err(e) => return MaybeFatalOrSuccessTransition::transient(Error::Implementation(e)),
+            Err(e) => return Err(ApiError::Transient(Error::Implementation(e))),
         }
 
         // If the Payjoin proposal was not found, check the fallback transaction, as it is
         // the second of two transactions whose IDs the receiver is aware of.
         match transaction_exists(fallback_tx.compute_txid()) {
-            Ok(Some(_)) => return self.fallback_tx_exists(),
+            Ok(Some(_)) => return self.fallback_tx_exists(buf),
             Ok(None) => {}
-            Err(e) => return MaybeFatalOrSuccessTransition::transient(Error::Implementation(e)),
+            Err(e) => return Err(ApiError::Transient(Error::Implementation(e))),
         }
 
-        MaybeFatalOrSuccessTransition::no_results(self.clone())
+        Ok(OptionalTransitionOutcome::Stasis(self.clone()))
     }
 
     pub fn extract_fallback_txid(&self) -> Txid {
@@ -1575,7 +1561,8 @@ impl Receiver<Monitor> {
 
     pub fn check_fallback_monitorable(
         &self,
-    ) -> MaybeFatalOrSuccessTransition<SessionEvent, Self, Error> {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<OptionalTransitionOutcome<(), Self>, ApiError<Error>> {
         let fallback_tx = self
             .state
             .psbt_context
@@ -1588,24 +1575,26 @@ impl Receiver<Monitor> {
         // the Payjoin proposal is going to change when the sender signs their non-SegWit address
         // one more time. The receiver cannot monitor the transaction, and should conclude the session.
         if has_empty_witness(&fallback_tx) {
-            return MaybeFatalOrSuccessTransition::success(SessionEvent::Closed(
-                SessionOutcome::PayjoinProposalSent,
-            ));
+            buf.push(SessionEvent::Closed(SessionOutcome::PayjoinProposalSent));
+            return Ok(OptionalTransitionOutcome::Progress(()));
         }
 
-        MaybeFatalOrSuccessTransition::no_results(self.clone())
+        Ok(OptionalTransitionOutcome::Stasis(self.clone()))
     }
 
-    pub fn fallback_tx_exists(&self) -> MaybeFatalOrSuccessTransition<SessionEvent, Self, Error> {
-        MaybeFatalOrSuccessTransition::success(SessionEvent::Closed(
-            SessionOutcome::FallbackBroadcasted,
-        ))
+    pub fn fallback_tx_exists(
+        &self,
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<OptionalTransitionOutcome<(), Self>, ApiError<Error>> {
+        buf.push(SessionEvent::Closed(SessionOutcome::FallbackBroadcasted));
+        Ok(OptionalTransitionOutcome::Progress(()))
     }
 
     pub fn payjoin_tx_exists(
         &self,
         payjoin_tx: Transaction,
-    ) -> MaybeFatalOrSuccessTransition<SessionEvent, Self, Error> {
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<OptionalTransitionOutcome<(), Self>, ApiError<Error>> {
         // TODO: should we check for witness and scriptsig on the tx?
         let mut sender_witnesses = vec![];
 
@@ -1615,9 +1604,8 @@ impl Receiver<Monitor> {
             sender_witnesses.push((input.script_sig.clone(), input.witness.clone()));
         }
         // Payjoin transaction with SegWit inputs was detected. Log the signatures and complete the session.
-        MaybeFatalOrSuccessTransition::success(SessionEvent::Closed(SessionOutcome::Success(
-            sender_witnesses,
-        )))
+        buf.push(SessionEvent::Closed(SessionOutcome::Success(sender_witnesses)));
+        Ok(OptionalTransitionOutcome::Progress(()))
     }
 }
 
@@ -1670,9 +1658,7 @@ pub mod test {
 
     use super::*;
     use crate::output_substitution::OutputSubstitution;
-    use crate::persist::{
-        InMemoryPersister, OptionalTransitionOutcome, RejectTransient, Rejection, SessionPersister,
-    };
+    use crate::persist::{InMemoryPersister, OptionalTransitionOutcome, SessionPersister};
     use crate::receive::optional_parameters::Params;
     use crate::receive::v2;
     use crate::ImplementationError;
@@ -1742,23 +1728,23 @@ pub mod test {
 
         // Nothing was spent, should be in the same state
         let persister = InMemoryPersister::default();
+        let mut buf = EventBuffer::new();
         let res = monitor
-            .check_payment(|_| Ok(None))
-            .save(&persister)
+            .check_payment(|_| Ok(None), &mut buf)
             .expect("InMemoryPersister shouldn't fail");
+        persister.drain(&mut buf).expect("drain");
         assert!(matches!(res, OptionalTransitionOutcome::Stasis(_)));
-        assert!(!persister.inner.read().expect("Shouldn't be poisoned").is_closed);
         assert_eq!(persister.inner.read().expect("Shouldn't be poisoned").events.len(), 0);
 
         // Payjoin was broadcasted, should progress to success
         let persister = InMemoryPersister::default();
+        let mut buf = EventBuffer::new();
         let res = monitor
-            .check_payment(|_| Ok(Some(payjoin_tx.clone())))
-            .save(&persister)
+            .check_payment(|_| Ok(Some(payjoin_tx.clone())), &mut buf)
             .expect("InMemoryPersister shouldn't fail");
+        persister.drain(&mut buf).expect("drain");
 
         assert!(matches!(res, OptionalTransitionOutcome::Progress(_)));
-        assert!(persister.inner.read().expect("Shouldn't be poisoned").is_closed);
         assert_eq!(persister.inner.read().expect("Shouldn't be poisoned").events.len(), 1);
         assert_eq!(
             persister.inner.read().expect("Shouldn't be poisoned").events.last(),
@@ -1770,20 +1756,23 @@ pub mod test {
 
         // Fallback was broadcasted, should progress to success
         let persister = InMemoryPersister::default();
+        let mut buf = EventBuffer::new();
         let res = monitor
-            .check_payment(|txid| {
-                // Emulate if one of the fallback outpoints was double spent
-                if txid == original_tx.compute_txid() {
-                    Ok(Some(original_tx.clone()))
-                } else {
-                    Ok(None)
-                }
-            })
-            .save(&persister)
+            .check_payment(
+                |txid| {
+                    // Emulate if one of the fallback outpoints was double spent
+                    if txid == original_tx.compute_txid() {
+                        Ok(Some(original_tx.clone()))
+                    } else {
+                        Ok(None)
+                    }
+                },
+                &mut buf,
+            )
             .expect("InMemoryPersister shouldn't fail");
+        persister.drain(&mut buf).expect("drain");
 
         assert!(matches!(res, OptionalTransitionOutcome::Progress(_)));
-        assert!(persister.inner.read().expect("Shouldn't be poisoned").is_closed);
         assert_eq!(persister.inner.read().expect("Shouldn't be poisoned").events.len(), 1);
         assert_eq!(
             persister.inner.read().expect("Shouldn't be poisoned").events.last(),
@@ -1807,13 +1796,16 @@ pub mod test {
         };
 
         let persister = InMemoryPersister::default();
+        let mut buf = EventBuffer::new();
         let res = monitor
-            .check_payment(|_| panic!("check_payment should return before this closure is called"))
-            .save(&persister)
+            .check_payment(
+                |_| panic!("check_payment should return before this closure is called"),
+                &mut buf,
+            )
             .expect("InMemoryPersister shouldn't fail");
+        persister.drain(&mut buf).expect("drain");
 
         assert!(matches!(res, OptionalTransitionOutcome::Progress(_)));
-        assert!(persister.inner.read().expect("Shouldn't be poisoned").is_closed);
         assert_eq!(persister.inner.read().expect("Shouldn't be poisoned").events.len(), 1);
         assert_eq!(
             persister.inner.read().expect("Shouldn't be poisoned").events.last(),
@@ -1836,22 +1828,23 @@ pub mod test {
             Ok(ret)
         }
 
+        let mut buf = EventBuffer::new();
         let maybe_inputs_seen = receiver
-            .check_inputs_not_owned(&mut |_| mock_callback(&mut call_count, false))
-            .save(&persister)
+            .check_inputs_not_owned(&mut |_| mock_callback(&mut call_count, false), &mut buf)
             .expect("Persister shouldn't fail");
+        persister.drain(&mut buf).expect("drain");
         assert_eq!(call_count, 1);
 
         let outputs_unknown = maybe_inputs_seen
-            .check_no_inputs_seen_before(&mut |_| mock_callback(&mut call_count, false))
-            .save(&persister)
+            .check_no_inputs_seen_before(&mut |_| mock_callback(&mut call_count, false), &mut buf)
             .expect("Persister shouldn't fail");
+        persister.drain(&mut buf).expect("drain");
         assert_eq!(call_count, 2);
 
         let _wants_outputs = outputs_unknown
-            .identify_receiver_outputs(&mut |_| mock_callback(&mut call_count, true))
-            .save(&persister)
+            .identify_receiver_outputs(&mut |_| mock_callback(&mut call_count, true), &mut buf)
             .expect("Persister shouldn't fail");
+        persister.drain(&mut buf).expect("drain");
         // there are 2 receiver outputs so we should expect this callback to run twice incrementing
         // call count twice
         assert_eq!(call_count, 4);
@@ -1909,18 +1902,16 @@ pub mod test {
         let receiver =
             v2::Receiver { state: unchecked_proposal, session_context: SHARED_CONTEXT.clone() };
 
-        let maybe_inputs_owned = receiver
-            .assume_interactive_receiver()
-            .save(&persister)
-            .expect("Persister shouldn't fail");
-        let maybe_inputs_seen = maybe_inputs_owned.check_inputs_not_owned(&mut |_| {
-            Err(ImplementationError::new(Error::Implementation("mock error".into())))
-        });
+        let mut buf = EventBuffer::new();
+        let maybe_inputs_owned = receiver.assume_interactive_receiver(&mut buf);
+        persister.drain(&mut buf).expect("Persister shouldn't fail");
+        let maybe_inputs_seen = maybe_inputs_owned.check_inputs_not_owned(
+            &mut |_| Err(ImplementationError::new(Error::Implementation("mock error".into()))),
+            &mut buf,
+        );
 
         match maybe_inputs_seen {
-            MaybeFatalTransition(Err(Rejection::Transient(RejectTransient(
-                Error::Implementation(error),
-            )))) => assert_eq!(
+            Err(ApiError::Transient(Error::Implementation(error))) => assert_eq!(
                 error.to_string(),
                 Error::Implementation("mock error".into()).to_string()
             ),
@@ -1937,21 +1928,19 @@ pub mod test {
         let receiver =
             v2::Receiver { state: unchecked_proposal, session_context: SHARED_CONTEXT.clone() };
 
-        let maybe_inputs_owned = receiver
-            .assume_interactive_receiver()
-            .save(&persister)
-            .expect("Persister shouldn't fail");
+        let mut buf = EventBuffer::new();
+        let maybe_inputs_owned = receiver.assume_interactive_receiver(&mut buf);
+        persister.drain(&mut buf).expect("Persister shouldn't fail");
         let maybe_inputs_seen = maybe_inputs_owned
-            .check_inputs_not_owned(&mut |_| Ok(false))
-            .save(&persister)
+            .check_inputs_not_owned(&mut |_| Ok(false), &mut buf)
             .expect("Persister shouldn't fail");
-        let outputs_unknown = maybe_inputs_seen.check_no_inputs_seen_before(&mut |_| {
-            Err(ImplementationError::new(Error::Implementation("mock error".into())))
-        });
+        persister.drain(&mut buf).expect("drain");
+        let outputs_unknown = maybe_inputs_seen.check_no_inputs_seen_before(
+            &mut |_| Err(ImplementationError::new(Error::Implementation("mock error".into()))),
+            &mut buf,
+        );
         match outputs_unknown {
-            MaybeFatalTransition(Err(Rejection::Transient(RejectTransient(
-                Error::Implementation(error),
-            )))) => assert_eq!(
+            Err(ApiError::Transient(Error::Implementation(error))) => assert_eq!(
                 error.to_string(),
                 Error::Implementation("mock error".into()).to_string()
             ),
@@ -1968,25 +1957,23 @@ pub mod test {
         let receiver =
             v2::Receiver { state: unchecked_proposal, session_context: SHARED_CONTEXT.clone() };
 
-        let maybe_inputs_owned = receiver
-            .assume_interactive_receiver()
-            .save(&persister)
-            .expect("Persister shouldn't fail");
+        let mut buf = EventBuffer::new();
+        let maybe_inputs_owned = receiver.assume_interactive_receiver(&mut buf);
+        persister.drain(&mut buf).expect("Persister shouldn't fail");
         let maybe_inputs_seen = maybe_inputs_owned
-            .check_inputs_not_owned(&mut |_| Ok(false))
-            .save(&persister)
+            .check_inputs_not_owned(&mut |_| Ok(false), &mut buf)
             .expect("Persister should not fail");
+        persister.drain(&mut buf).expect("drain");
         let outputs_unknown = maybe_inputs_seen
-            .check_no_inputs_seen_before(&mut |_| Ok(false))
-            .save(&persister)
+            .check_no_inputs_seen_before(&mut |_| Ok(false), &mut buf)
             .expect("Persister should not fail");
-        let wants_outputs = outputs_unknown.identify_receiver_outputs(&mut |_| {
-            Err(ImplementationError::new(Error::Implementation("mock error".into())))
-        });
+        persister.drain(&mut buf).expect("drain");
+        let wants_outputs = outputs_unknown.identify_receiver_outputs(
+            &mut |_| Err(ImplementationError::new(Error::Implementation("mock error".into()))),
+            &mut buf,
+        );
         match wants_outputs {
-            MaybeFatalTransition(Err(Rejection::Transient(RejectTransient(
-                Error::Implementation(error),
-            )))) => assert_eq!(
+            Err(ApiError::Transient(Error::Implementation(error))) => assert_eq!(
                 error.to_string(),
                 Error::Implementation("mock error".into()).to_string()
             ),

@@ -441,16 +441,22 @@ mod integration {
                 // Progress past the first typestate so we can send a encrypted error response
                 // TODO: when the reply key is being persisted as its own session event we can fail at the
                 // unchecked original typestate
-                let proposal = proposal.assume_interactive_receiver().save(&persister)?;
+                let mut buf = EventBuffer::new();
+                let proposal = proposal.assume_interactive_receiver(&mut buf);
+                persister.drain(&mut buf)?;
 
                 // Generate replyable error
-                let server_error = proposal
+                let mut buf = EventBuffer::new();
+                let api_err = proposal
                     .clone()
-                    .check_inputs_not_owned(&mut |_| Ok(true))
-                    .save(&persister)
-                    .expect_err("should fail")
-                    .api_error()
-                    .expect("expected api error");
+                    .check_inputs_not_owned(&mut |_| Ok(true), &mut buf)
+                    .expect_err("should fail");
+                persister.drain(&mut buf)?;
+                let server_error = match api_err {
+                    payjoin::persist::ApiError::Fatal(e)
+                    | payjoin::persist::ApiError::Transient(e)
+                    | payjoin::persist::ApiError::FatalWithState(e, _) => e,
+                };
                 // TODO: this should be replaced by comparing the error itself once the error types impl PartialEq
                 // Issue: https://github.com/payjoin/rust-payjoin/issues/645
                 assert_eq!(
@@ -474,7 +480,11 @@ mod integration {
                     .await?;
 
                 let err_bytes = err_response.bytes().await?;
-                has_error.process_error_response(&err_bytes, err_ctx).save(&persister)?;
+                let mut buf = EventBuffer::new();
+                has_error
+                    .process_error_response(&err_bytes, err_ctx, &mut buf)
+                    .map_err(|e| format!("process_error_response failed: {e:?}"))?;
+                persister.drain(&mut buf)?;
 
                 // Ensure the session is closed properly
                 let (_, session_history) = replay_receiver_event_log(&persister)?;
@@ -555,12 +565,14 @@ mod integration {
             // Receiver cannot validate that the sender has broadcasted the Payjoin proposal or the fallback transaction.
             // The sender is using a non-SegWit address, so their signature is going to change the TXID. So we test whether the
             // function exists early and does not call the closure.
+            let mut buf = EventBuffer::new();
             monitoring_payment
-                .check_payment(|_| {
-                    panic!("when the sender is using a non-SegWit address type, the check_payment function should skip the check and return success")
-                })
-                .save(&recv_persister)
+                .check_payment(
+                    |_| panic!("when the sender is using a non-SegWit address type, the check_payment function should skip the check and return success"),
+                    &mut buf,
+                )
                 .expect("receiver should successfully monitor for the payment");
+            recv_persister.drain(&mut buf)?;
 
             let (_session, session_history) = replay_receiver_event_log(&recv_persister)?;
             assert_eq!(
@@ -610,19 +622,22 @@ mod integration {
             );
 
             // Receiver should be able to validate that the sender has broadcasted the Payjoin proposal.
+            let mut buf = EventBuffer::new();
             monitoring_payment
-                .check_payment(|txid| {
-                    let get_tx_result = receiver.get_raw_transaction(txid);
-                    match get_tx_result {
-                        Ok(tx) =>
-                            Ok(Some(tx.transaction().expect("transaction should be decodable"))),
-                        Err(_) => {
-                            panic!("should be able to find the payjoin proposal broadcasted")
+                .check_payment(
+                    |txid| {
+                        let get_tx_result = receiver.get_raw_transaction(txid);
+                        match get_tx_result {
+                            Ok(tx) => Ok(Some(
+                                tx.transaction().expect("transaction should be decodable"),
+                            )),
+                            Err(_) => panic!("should be able to find the payjoin proposal broadcasted"),
                         }
-                    }
-                })
-                .save(&recv_persister)
+                    },
+                    &mut buf,
+                )
                 .expect("receiver should successfully monitor for the payment");
+            recv_persister.drain(&mut buf)?;
 
             // Receiver session should have completed with a Success, along with information on the
             // sender signatures on the Payjoin that was broadcasted.
@@ -692,19 +707,22 @@ mod integration {
             );
 
             // Receiver should be able to validate that the sender has broadcasted the Payjoin proposal.
+            let mut buf = EventBuffer::new();
             monitoring_payment
-                .check_payment(|txid| {
-                    let get_tx_result = receiver.get_raw_transaction(txid);
-                    match get_tx_result {
-                        Ok(tx) =>
-                            Ok(Some(tx.transaction().expect("transaction should be decodable"))),
-                        Err(_) => {
-                            panic!("should be able to find the payjoin proposal broadcasted")
+                .check_payment(
+                    |txid| {
+                        let get_tx_result = receiver.get_raw_transaction(txid);
+                        match get_tx_result {
+                            Ok(tx) => Ok(Some(
+                                tx.transaction().expect("transaction should be decodable"),
+                            )),
+                            Err(_) => panic!("should be able to find the payjoin proposal broadcasted"),
                         }
-                    }
-                })
-                .save(&recv_persister)
+                    },
+                    &mut buf,
+                )
                 .expect("receiver should successfully monitor for the payment");
+            recv_persister.drain(&mut buf)?;
 
             // Receiver session should have completed with a Success, along with information on the
             // sender signatures on the Payjoin that was broadcasted.
@@ -771,17 +789,22 @@ mod integration {
             // Receiver should be able to validate that the sender has broadcasted the fallback transaction.
             // The check_payment closure should be called twice: first for the Payjoin proposal, which will not be found,
             // and then for the fallback transaction, which will be found..
+            let mut buf = EventBuffer::new();
             monitoring_payment
-                .check_payment(|txid| {
-                    let get_tx_result = receiver.get_raw_transaction(txid);
-                    match get_tx_result {
-                        Ok(tx) =>
-                            Ok(Some(tx.transaction().expect("transaction should be decodable"))),
-                        Err(_) => Ok(None),
-                    }
-                })
-                .save(&recv_persister)
+                .check_payment(
+                    |txid| {
+                        let get_tx_result = receiver.get_raw_transaction(txid);
+                        match get_tx_result {
+                            Ok(tx) => Ok(Some(
+                                tx.transaction().expect("transaction should be decodable"),
+                            )),
+                            Err(_) => Ok(None),
+                        }
+                    },
+                    &mut buf,
+                )
                 .expect("receiver should successfully monitor for the payment");
+            recv_persister.drain(&mut buf)?;
 
             // Receiver session should have completed with a Success and a fallback session
             // outcome.
@@ -911,9 +934,11 @@ mod integration {
                 .body(req.body)
                 .send()
                 .await?;
+            let mut buf = EventBuffer::new();
             let monitoring_payment = payjoin_proposal
-                .process_response(&response.bytes().await?, ctx)
-                .save(recv_persister)?;
+                .process_response(&response.bytes().await?, ctx, &mut buf)
+                .map_err(|e| format!("process_response failed: {e:?}"))?;
+            recv_persister.drain(&mut buf)?;
 
             // **********************
             // Inside the Sender:
@@ -1116,10 +1141,11 @@ mod integration {
                         .body(req.body)
                         .send()
                         .await?;
+                    let mut buf = EventBuffer::new();
                     payjoin_proposal
-                        .process_response(&response.bytes().await?, ctx)
-                        .save(&recv_persister)
-                        .map_err(|e| e.to_string())?;
+                        .process_response(&response.bytes().await?, ctx, &mut buf)
+                        .map_err(|e| format!("{e:?}"))?;
+                    recv_persister.drain(&mut buf).map_err(|e| e.to_string())?;
                     Ok::<_, BoxSendSyncError>(())
                 });
 
@@ -1195,33 +1221,49 @@ mod integration {
             let _to_broadcast_in_failure_case = proposal.extract_tx_to_schedule_broadcast();
 
             // Receive Check 2: receiver can't sign for proposal inputs
+            let mut buf = EventBuffer::new();
             let proposal = proposal
-                .check_inputs_not_owned(&mut |input| {
-                    let address = bitcoin::Address::from_script(input, bitcoin::Network::Regtest)
-                        .map_err(ImplementationError::new)?;
-                    receiver
-                        .get_address_info(&address)
-                        .map(|info| info.is_mine)
-                        .map_err(ImplementationError::new)
-                })
-                .save(recv_persister)?;
+                .check_inputs_not_owned(
+                    &mut |input| {
+                        let address =
+                            bitcoin::Address::from_script(input, bitcoin::Network::Regtest)
+                                .map_err(ImplementationError::new)?;
+                        receiver
+                            .get_address_info(&address)
+                            .map(|info| info.is_mine)
+                            .map_err(ImplementationError::new)
+                    },
+                    &mut buf,
+                )
+                .map_err(|e| format!("check_inputs_not_owned failed: {e:?}"))?;
+            recv_persister.drain(&mut buf)?;
 
             // Receive Check 3: have we seen this input before? More of a check for non-interactive i.e. payment processor receivers.
+            let mut buf = EventBuffer::new();
             let payjoin = proposal
-                .check_no_inputs_seen_before(&mut |_| Ok(false))
-                .save(recv_persister)?
-                .identify_receiver_outputs(&mut |output_script| {
-                    let address =
-                        bitcoin::Address::from_script(output_script, bitcoin::Network::Regtest)
-                            .map_err(ImplementationError::new)?;
-                    receiver
-                        .get_address_info(&address)
-                        .map(|info| info.is_mine)
-                        .map_err(ImplementationError::new)
-                })
-                .save(recv_persister)?;
+                .check_no_inputs_seen_before(&mut |_| Ok(false), &mut buf)
+                .map_err(|e| format!("check_no_inputs_seen_before failed: {e:?}"))?;
+            recv_persister.drain(&mut buf)?;
+            let mut buf = EventBuffer::new();
+            let payjoin = payjoin
+                .identify_receiver_outputs(
+                    &mut |output_script| {
+                        let address =
+                            bitcoin::Address::from_script(output_script, bitcoin::Network::Regtest)
+                                .map_err(ImplementationError::new)?;
+                        receiver
+                            .get_address_info(&address)
+                            .map(|info| info.is_mine)
+                            .map_err(ImplementationError::new)
+                    },
+                    &mut buf,
+                )
+                .map_err(|e| format!("identify_receiver_outputs failed: {e:?}"))?;
+            recv_persister.drain(&mut buf)?;
 
-            let payjoin = payjoin.commit_outputs().save(recv_persister)?;
+            let mut buf = EventBuffer::new();
+            let payjoin = payjoin.commit_outputs(&mut buf);
+            recv_persister.drain(&mut buf)?;
 
             let inputs = match custom_inputs {
                 Some(inputs) => inputs,
@@ -1239,37 +1281,45 @@ mod integration {
                     vec![selected_input]
                 }
             };
+            let mut buf = EventBuffer::new();
             let payjoin = payjoin
                 .contribute_inputs(inputs)
                 .map_err(|e| format!("Failed to contribute inputs: {e:?}"))?
-                .commit_inputs()
-                .save(recv_persister)?;
+                .commit_inputs(&mut buf);
+            recv_persister.drain(&mut buf)?;
 
+            let mut buf = EventBuffer::new();
             let payjoin = payjoin
                 .apply_fee_range(
                     Some(FeeRate::BROADCAST_MIN),
                     Some(FeeRate::from_sat_per_vb_u32(2)),
+                    &mut buf,
                 )
-                .save(recv_persister)?;
+                .map_err(|e| format!("apply_fee_range failed: {e:?}"))?;
+            recv_persister.drain(&mut buf)?;
 
             // Sign and finalize the proposal PSBT
+            let mut buf = EventBuffer::new();
             let payjoin = payjoin
-                .finalize_proposal(|psbt: &Psbt| {
-                    receiver
-                        // call RPC manually to pass custom options
-                        .call::<corepc_node::vtype::WalletProcessPsbt>(
-                            "walletprocesspsbt",
-                            &[
-                                json!(psbt.to_string()),
-                                json!(None as Option<bool>),
-                                json!(None as Option<&str>),
-                                json!(Some(true)), // check that the receiver properly clears keypaths
-                            ],
-                        )
-                        .map(|res| Psbt::from_str(&res.psbt).expect("psbt should be valid"))
-                        .map_err(ImplementationError::new)
-                })
-                .save(recv_persister)?;
+                .finalize_proposal(
+                    |psbt: &Psbt| {
+                        receiver
+                            .call::<corepc_node::vtype::WalletProcessPsbt>(
+                                "walletprocesspsbt",
+                                &[
+                                    json!(psbt.to_string()),
+                                    json!(None as Option<bool>),
+                                    json!(None as Option<&str>),
+                                    json!(Some(true)),
+                                ],
+                            )
+                            .map(|res| Psbt::from_str(&res.psbt).expect("psbt should be valid"))
+                            .map_err(ImplementationError::new)
+                    },
+                    &mut buf,
+                )
+                .map_err(|e| format!("finalize_proposal failed: {e:?}"))?;
+            recv_persister.drain(&mut buf)?;
             Ok(payjoin)
         }
 
