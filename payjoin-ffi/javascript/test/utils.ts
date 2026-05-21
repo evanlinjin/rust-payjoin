@@ -8,7 +8,6 @@ import { payjoin } from "payjoin";
 
 class MemoryEventLog {
     readonly events: string[] = [];
-    closed = false;
 
     save(event: string): void {
         this.events.push(event);
@@ -17,15 +16,10 @@ class MemoryEventLog {
     load(): string[] {
         return [...this.events];
     }
-
-    close(): void {
-        this.closed = true;
-    }
 }
 
 class MemoryEventLogAsync {
     readonly events: string[] = [];
-    closed = false;
 
     async save(event: string): Promise<void> {
         this.events.push(event);
@@ -33,10 +27,6 @@ class MemoryEventLogAsync {
 
     async load(): Promise<string[]> {
         return [...this.events];
-    }
-
-    async close(): Promise<void> {
-        this.closed = true;
     }
 }
 

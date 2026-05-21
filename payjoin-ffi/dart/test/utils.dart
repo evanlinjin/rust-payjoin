@@ -8,7 +8,6 @@ import "package:payjoin/payjoin.dart" as payjoin;
 
 class _InMemoryEventLog {
   final List<String> events = [];
-  bool closed = false;
 
   void save(String event) {
     events.add(event);
@@ -17,15 +16,10 @@ class _InMemoryEventLog {
   List<String> load() {
     return List.of(events);
   }
-
-  void close() {
-    closed = true;
-  }
 }
 
 class _InMemoryEventLogAsync {
   final List<String> events = [];
-  bool closed = false;
 
   Future<void> save(String event) async {
     events.add(event);
@@ -33,10 +27,6 @@ class _InMemoryEventLogAsync {
 
   Future<List<String>> load() async {
     return List.of(events);
-  }
-
-  Future<void> close() async {
-    closed = true;
   }
 }
 

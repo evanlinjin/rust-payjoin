@@ -10,16 +10,12 @@ the queued events, appends them to an in-memory list, then commits.
 class _InMemoryEventLog:
     def __init__(self):
         self.events = []
-        self.closed = False
 
     def save(self, json_event: str):
         self.events.append(json_event)
 
     def load(self):
         return list(self.events)
-
-    def close(self):
-        self.closed = True
 
 
 class InMemoryReceiverPersister(_InMemoryEventLog):
@@ -45,16 +41,12 @@ class InMemorySenderPersister(_InMemoryEventLog):
 class _InMemoryEventLogAsync:
     def __init__(self):
         self.events = []
-        self.closed = False
 
     async def save(self, json_event: str):
         self.events.append(json_event)
 
     async def load(self):
         return list(self.events)
-
-    async def close(self):
-        self.closed = True
 
 
 class InMemoryReceiverPersisterAsync(_InMemoryEventLogAsync):
