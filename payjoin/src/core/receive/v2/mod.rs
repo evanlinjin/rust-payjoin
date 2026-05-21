@@ -54,9 +54,9 @@ use crate::ohttp::{
 };
 use crate::output_substitution::OutputSubstitution;
 use crate::persist::{
-    EventBuffer, MaybeFatalOrSuccessTransition, MaybeFatalTransition,
-    MaybeFatalTransitionWithNoResults, MaybeSuccessTransition, MaybeTransientTransition,
-    NextStateTransition, Provisional,
+    ApiError, EventBuffer, MaybeFatalOrSuccessTransition, MaybeFatalTransition,
+    MaybeSuccessTransition, MaybeTransientTransition, NextStateTransition,
+    OptionalTransitionOutcome, Provisional,
 };
 use crate::receive::{
     check_references, parse_payload, InputOwnedTag, InputPair, InputSeenTag, OriginalPayload,
@@ -465,11 +465,10 @@ impl Receiver<Initialized> {
         self,
         body: &[u8],
         context: ohttp::ClientResponse,
-    ) -> MaybeFatalTransitionWithNoResults<
-        SessionEvent,
-        Receiver<UncheckedOriginalPayload>,
-        Receiver<Initialized>,
-        ProtocolError,
+        buf: &mut EventBuffer<SessionEvent>,
+    ) -> Result<
+        OptionalTransitionOutcome<Receiver<UncheckedOriginalPayload>, Receiver<Initialized>>,
+        ApiError<ProtocolError>,
     > {
         let current_state = self.clone();
         let proposal = match self.inner_process_res(body, context) {
@@ -479,34 +478,29 @@ impl Receiver<Initialized> {
                     ref directory_error,
                 ))) =>
                     if directory_error.is_fatal() {
-                        return MaybeFatalTransitionWithNoResults::fatal(
-                            SessionEvent::Closed(SessionOutcome::Failure),
-                            e,
-                        );
+                        buf.push(SessionEvent::Closed(SessionOutcome::Failure));
+                        return Err(ApiError::Fatal(e));
                     } else {
-                        return MaybeFatalTransitionWithNoResults::transient(e);
+                        return Err(ApiError::Transient(e));
                     },
-                _ =>
-                    return MaybeFatalTransitionWithNoResults::fatal(
-                        SessionEvent::Closed(SessionOutcome::Failure),
-                        e,
-                    ),
+                _ => {
+                    buf.push(SessionEvent::Closed(SessionOutcome::Failure));
+                    return Err(ApiError::Fatal(e));
+                }
             },
         };
 
         if let Some((proposal, reply_key)) = proposal {
-            MaybeFatalTransitionWithNoResults::success(
-                SessionEvent::RetrievedOriginalPayload {
-                    original: proposal.clone(),
-                    reply_key: reply_key.clone(),
-                },
-                Receiver {
-                    state: UncheckedOriginalPayload { original: proposal },
-                    session_context: SessionContext { reply_key, ..current_state.session_context },
-                },
-            )
+            buf.push(SessionEvent::RetrievedOriginalPayload {
+                original: proposal.clone(),
+                reply_key: reply_key.clone(),
+            });
+            Ok(OptionalTransitionOutcome::Progress(Receiver {
+                state: UncheckedOriginalPayload { original: proposal },
+                session_context: SessionContext { reply_key, ..current_state.session_context },
+            }))
         } else {
-            MaybeFatalTransitionWithNoResults::no_results(current_state)
+            Ok(OptionalTransitionOutcome::Stasis(current_state))
         }
     }
 

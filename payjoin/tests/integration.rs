@@ -373,9 +373,13 @@ mod integration {
                     .send()
                     .await?;
                 assert!(response.status().is_success(), "error response: {}", response.status());
-                let response_body = session
-                    .process_response(response.bytes().await?.to_vec().as_slice(), ctx)
-                    .save(&persister)?;
+                let mut buf = EventBuffer::new();
+                let response_body = session.process_response(
+                    response.bytes().await?.to_vec().as_slice(),
+                    ctx,
+                    &mut buf,
+                )?;
+                persister.drain(&mut buf)?;
                 // No proposal yet since sender has not responded
                 let session =
                     if let OptionalTransitionOutcome::Stasis(current_state) = response_body {
@@ -421,9 +425,13 @@ mod integration {
                     .send()
                     .await?;
                 // POST payjoin
-                let outcome = session
-                    .process_response(response.bytes().await?.to_vec().as_slice(), ctx)
-                    .save(&persister)?;
+                let mut buf = EventBuffer::new();
+                let outcome = session.process_response(
+                    response.bytes().await?.to_vec().as_slice(),
+                    ctx,
+                    &mut buf,
+                )?;
+                persister.drain(&mut buf)?;
                 let proposal = if let OptionalTransitionOutcome::Progress(psbt) = outcome {
                     psbt
                 } else {
@@ -832,9 +840,13 @@ mod integration {
                 .send()
                 .await?;
             assert!(response.status().is_success(), "error response: {}", response.status());
-            let response_body = session
-                .process_response(response.bytes().await?.to_vec().as_slice(), ctx)
-                .save(recv_persister)?;
+            let mut buf = EventBuffer::new();
+            let response_body = session.process_response(
+                response.bytes().await?.to_vec().as_slice(),
+                ctx,
+                &mut buf,
+            )?;
+            recv_persister.drain(&mut buf)?;
             // No proposal yet since sender has not responded
             let session = if let OptionalTransitionOutcome::Stasis(current_state) = response_body {
                 current_state
@@ -877,9 +889,13 @@ mod integration {
                 .send()
                 .await?;
             // POST payjoin
-            let outcome = session
-                .process_response(response.bytes().await?.to_vec().as_slice(), ctx)
-                .save(recv_persister)?;
+            let mut buf = EventBuffer::new();
+            let outcome = session.process_response(
+                response.bytes().await?.to_vec().as_slice(),
+                ctx,
+                &mut buf,
+            )?;
+            recv_persister.drain(&mut buf)?;
             let proposal = if let OptionalTransitionOutcome::Progress(psbt) = outcome {
                 psbt
             } else {
@@ -1067,10 +1083,13 @@ mod integration {
                             .await?;
 
                         if response.status() == 200 {
-                            let proposal = session
-                                .clone()
-                                .process_response(response.bytes().await?.to_vec().as_slice(), ctx)
-                                .save(&recv_persister)?;
+                            let mut buf = EventBuffer::new();
+                            let proposal = session.clone().process_response(
+                                response.bytes().await?.to_vec().as_slice(),
+                                ctx,
+                                &mut buf,
+                            )?;
+                            recv_persister.drain(&mut buf)?;
                             if let OptionalTransitionOutcome::Progress(unchecked_proposal) =
                                 proposal
                             {
