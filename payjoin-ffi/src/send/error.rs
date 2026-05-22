@@ -106,23 +106,36 @@ impl From<send::ResponseError> for ResponseError {
 #[error(transparent)]
 pub struct WellKnownError(#[from] send::WellKnownError);
 
+/// Discriminator for the underlying protocol-level error inside
+/// [`SenderApiError`]. Foreign code can match on the kind without parsing
+/// the `msg` string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SenderErrorKind {
+    /// HPKE / OHTTP encapsulation error processing the directory response.
+    Encapsulation,
+    /// Structured error returned by the receiver (BIP78 well-known,
+    /// validation error, or unrecognized error code). The `msg` field
+    /// carries the human-readable details. For typed inspection of
+    /// well-known error codes, [`ResponseError`] remains accessible as a
+    /// standalone uniffi type for callers that need it.
+    Response,
+}
+
 /// Surface-level error returned by sender action methods that operate on a
 /// [`crate::send::SenderEventBuffer`]. Storage errors are not represented here
 /// — those surface from the caller's drain loop.
+///
+/// Mirrors the shape of [`crate::receive::ReceiverApiError`]: a `kind`
+/// discriminator paired with a human-readable `msg`. Foreign code matches on
+/// (severity, kind) for control flow.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum SenderApiError {
     /// Retry the action from the same state.
-    #[error("Transient encapsulation error: {0}")]
-    TransientEncapsulation(Arc<EncapsulationError>),
-    /// Session is terminally closed (encapsulation error).
-    #[error("Fatal encapsulation error: {0}")]
-    FatalEncapsulation(Arc<EncapsulationError>),
-    /// Retry the action from the same state.
-    #[error("Transient response error: {0}")]
-    TransientResponse(ResponseError),
-    /// Session is terminally closed (response error).
-    #[error("Fatal response error: {0}")]
-    FatalResponse(ResponseError),
+    #[error("Transient {kind:?} error: {msg}")]
+    Transient { kind: SenderErrorKind, msg: String },
+    /// Session is terminally closed.
+    #[error("Fatal {kind:?} error: {msg}")]
+    Fatal { kind: SenderErrorKind, msg: String },
 }
 
 impl SenderApiError {
@@ -131,12 +144,14 @@ impl SenderApiError {
         err: payjoin::persist::ApiError<send::v2::EncapsulationError>,
     ) -> Self {
         match err {
-            payjoin::persist::ApiError::Transient(e) =>
-                SenderApiError::TransientEncapsulation(Arc::new(e.into())),
+            payjoin::persist::ApiError::Transient(e) => SenderApiError::Transient {
+                kind: SenderErrorKind::Encapsulation,
+                msg: e.to_string(),
+            },
             payjoin::persist::ApiError::Fatal(e) =>
-                SenderApiError::FatalEncapsulation(Arc::new(e.into())),
+                SenderApiError::Fatal { kind: SenderErrorKind::Encapsulation, msg: e.to_string() },
             payjoin::persist::ApiError::FatalWithState(e, _) =>
-                SenderApiError::FatalEncapsulation(Arc::new(e.into())),
+                SenderApiError::Fatal { kind: SenderErrorKind::Encapsulation, msg: e.to_string() },
         }
     }
 
@@ -145,10 +160,12 @@ impl SenderApiError {
         err: payjoin::persist::ApiError<send::ResponseError>,
     ) -> Self {
         match err {
-            payjoin::persist::ApiError::Transient(e) => SenderApiError::TransientResponse(e.into()),
-            payjoin::persist::ApiError::Fatal(e) => SenderApiError::FatalResponse(e.into()),
+            payjoin::persist::ApiError::Transient(e) =>
+                SenderApiError::Transient { kind: SenderErrorKind::Response, msg: e.to_string() },
+            payjoin::persist::ApiError::Fatal(e) =>
+                SenderApiError::Fatal { kind: SenderErrorKind::Response, msg: e.to_string() },
             payjoin::persist::ApiError::FatalWithState(e, _) =>
-                SenderApiError::FatalResponse(e.into()),
+                SenderApiError::Fatal { kind: SenderErrorKind::Response, msg: e.to_string() },
         }
     }
 }

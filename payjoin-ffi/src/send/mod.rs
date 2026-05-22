@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 pub use error::{
     BuildSenderError, CreateRequestError, EncapsulationError, PsbtParseError, ResponseError,
-    SenderApiError, SenderInputError,
+    SenderApiError, SenderErrorKind, SenderInputError,
 };
 
 pub use crate::error::{ImplementationError, ProvisionalConfirmError, SerdeJsonError};

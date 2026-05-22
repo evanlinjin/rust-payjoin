@@ -193,6 +193,38 @@ class InMemoryReceiverPersisterAsync:
 See `payjoin-ffi/{python,javascript,dart}/test/utils.{py,ts,dart}` for the
 canonical reference implementations in each language.
 
+## Surface-level errors
+
+Both `ReceiverApiError` and `SenderApiError` share the same shape: a
+`kind` discriminator paired with a `msg` string. Foreign code matches
+on (severity, kind) for control flow.
+
+```python
+try:
+    receiver.process_response(body, ctx, buf)
+except ReceiverApiError.Transient as e:
+    if e.kind == ReceiverErrorKind.IntoUrl:
+        # retryable URL parsing error
+        ...
+except ReceiverApiError.FatalWithReplyableState as e:
+    # session is closed, but we can reply to the sender
+    state = e.state  # Arc<HasReplyableError>
+    ...
+
+try:
+    sender.process_response(body, ctx, buf)
+except SenderApiError.Transient as e:
+    if e.kind == SenderErrorKind.Encapsulation:
+        # retryable OHTTP / HPKE error
+        ...
+    elif e.kind == SenderErrorKind.Response:
+        # structured error from receiver — see msg for details
+        ...
+```
+
+Receiver kinds: `Protocol`, `Implementation`, `IntoUrl`, `Unexpected`.
+Sender kinds: `Encapsulation`, `Response`.
+
 ## Provisional confirm failures
 
 `Provisional::confirm` can fail in three distinct ways. Foreign code can
